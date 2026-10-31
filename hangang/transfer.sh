@@ -19,6 +19,16 @@
 #
 # Re-running `push` resumes: finished files are skipped by size+mtime, partial
 # ones continue (--append-verify re-checks the whole file after appending).
+#
+# The other direction -- training output back to the host that will run
+# inference on it:
+#   bash hangang/transfer.sh pull                       # $RUNS_REMOTE -> $RUNS_LOCAL
+#   ONLY="df3-stage2-001" bash hangang/transfer.sh pull  # one run
+#   bash hangang/transfer.sh runs                        # what is there, and what is missing here
+#
+# `pull` never deletes locally, so a checkpoint kept here after Hangang's
+# 15-day purge took it (keepalive.sh) stays. One stream measured 480 MB/s on
+# 5 GB checkpoints, which is the line, so there is nothing to parallelise.
 
 set -euo pipefail
 
@@ -28,7 +38,13 @@ DEST="${DEST:-/store/deepfold3/packed}"         # local staging tree
 REMOTE="${REMOTE:-/scratch/${HANGANG_USER}/deepfold3/data}"
 STREAMS="${STREAMS:-8}"
 PERSIST="${PERSIST:-24h}"
-ONLY="${ONLY:-}"                                 # optional subtree(s) relative to $DEST
+ONLY="${ONLY:-}"                                 # optional subtree(s), relative to $DEST (push) or $RUNS_REMOTE (pull)
+RUNS_LOCAL="${RUNS_LOCAL:-/store/deepfold3/runs}"
+RUNS_REMOTE="${RUNS_REMOTE:-/scratch/${HANGANG_USER}/deepfold3/runs}"
+# WandB's run directory is not under runs/ (it is $REPO/wandb), so this excludes
+# nothing today; it is here so that a later run writing its own wandb/ beside
+# the checkpoints does not quietly double the pull.
+PULL_EXCLUDE="${PULL_EXCLUDE:-wandb .wandb _logs *.tmp}"
 CM="${HOME}/.ssh/cm-hangang-${HANGANG_USER}"
 SSH=(ssh -o ControlPath="${CM}" -o ServerAliveInterval=60 -o ServerAliveCountMax=10)
 WORK="${DEST}/_logs/transfer"
@@ -116,12 +132,46 @@ status)
         awk -F'\t' '$2 != $3 {bad++; print} END {printf "%d file(s) missing or incomplete\n", bad+0}'
     ;;
 
+pull)
+    need_master
+    ex=()
+    for p in ${PULL_EXCLUDE}; do ex+=(--exclude "${p}"); done
+    srcs=()
+    if [[ -n "${ONLY}" ]]; then
+        read -r -a want <<<"${ONLY}"
+        for w in "${want[@]}"; do srcs+=("${HANGANG_USER}@${HOST}:${RUNS_REMOTE}/${w}"); done
+    else
+        srcs+=("${HANGANG_USER}@${HOST}:${RUNS_REMOTE}/")
+    fi
+    mkdir -p "${RUNS_LOCAL}"
+    echo "Pulling ${ONLY:-everything} from ${HOST}:${RUNS_REMOTE} -> ${RUNS_LOCAL}"
+    echo "  excluding: ${PULL_EXCLUDE}"
+    # A checkpoint being written right now has the wrong size, so it is skipped
+    # and picked up by the next pull rather than landing here truncated.
+    rsync -a --partial --append-verify --info=stats1,progress2 \
+        "${ex[@]}" -e "${SSH[*]}" "${srcs[@]}" "${RUNS_LOCAL}/"
+    ;;
+
+runs)
+    need_master
+    echo "--- ${HOST}:${RUNS_REMOTE}"
+    remote "cd '${RUNS_REMOTE}' && du -sh */ 2>/dev/null"
+    echo "--- missing or short in ${RUNS_LOCAL}"
+    remote "cd '${RUNS_REMOTE}' && find . -type f -printf '%P\t%s\n'" | sort >"/tmp/hangang-runs-remote.$$"
+    (cd "${RUNS_LOCAL}" 2>/dev/null && find . -type f -printf '%P\t%s\n' | sort) >"/tmp/hangang-runs-local.$$"
+    join -t$'\t' -a1 -e MISSING -o 0,1.2,2.2 \
+        "/tmp/hangang-runs-remote.$$" "/tmp/hangang-runs-local.$$" |
+        awk -F'\t' '$2 != $3 {n++; printf "%-56s remote %14s  local %14s\n", $1, $2, $3}
+                    END {printf "%d file(s) to pull\n", n+0}'
+    rm -f "/tmp/hangang-runs-remote.$$" "/tmp/hangang-runs-local.$$"
+    ;;
+
 close)
     "${SSH[@]}" -O exit "${HANGANG_USER}@${HOST}" || true
     ;;
 
 *)
-    sed -n '2,22p' "$0"
+    sed -n '2,31p' "$0"
     exit 1
     ;;
 esac

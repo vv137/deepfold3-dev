@@ -18,7 +18,7 @@ local (source host)                          Hangang
 | Script | Where | What |
 | --- | --- | --- |
 | `pack_all.sh` | source host | build the packed staging tree (resumable, verifies each pack) |
-| `transfer.sh` | source host | `connect` (one OTP) → `push` (parallel resumable rsync) → `verify` (sha256 on the data mover) |
+| `transfer.sh` | source host | `connect` (one OTP) → `push` (parallel resumable rsync) → `verify` (sha256 on the data mover); `pull` / `runs` bring the training output back |
 | `env.sh` | Hangang | paths, uv, Slurm comment, NCCL/Slingshot settings (`df3_slingshot_env`: aws-ofi-nccl module, hsn0 rendezvous; multi-node only) — `DF3_SLURM_*` defaults to `field=sciai;appl=pytorch-ddp` |
 | `setup_env.sh` | Hangang GPU login node | aarch64 venv via `uv sync --frozen`, then torch swapped to the `cu126` build (driver is CUDA 12.8); afterwards never `uv run`/`uv sync` there |
 | `check.sbatch` | 1 GPU node | GPUs, NCCL all-reduce, pack integrity, file count, training DataLoader smoke test |
@@ -68,6 +68,26 @@ bash hangang/transfer.sh status        # anything missing or short
 Push a small set first (`ONLY="distillation/patchr_training" bash hangang/transfer.sh push`)
 to measure the line rate; at 1 GB/s the full ~40 TB takes ~11 h, at 100 MB/s ~5 days.
 The data mover (`hangang-dm.ksc.re.kr`) has no CPU-time limit, unlike the login nodes.
+
+### Bringing the checkpoints back
+
+```bash
+bash hangang/transfer.sh runs                        # remote sizes, and what is missing here
+ONLY="df3-stage2-001" bash hangang/transfer.sh pull  # one run
+bash hangang/transfer.sh pull                        # every run
+```
+
+`pull` goes `$RUNS_REMOTE` (`/scratch/$USER/deepfold3/runs`) → `$RUNS_LOCAL`
+(`/store/deepfold3/runs`) and takes the same `ONLY` as `push`, so a single run
+comes back without the smoke tests' checkpoints. `PULL_EXCLUDE` defaults to
+`wandb .wandb _logs *.tmp`; WandB writes to `$REPO/wandb`, not under `runs/`, so
+that excludes nothing today and is there for a run that writes its own.
+
+Nothing is deleted locally, so a checkpoint kept here after the 15-day purge
+took the remote copy (`keepalive.sh`) stays. A checkpoint still being written
+has the wrong size, is skipped, and arrives on the next `pull` rather than
+landing truncated. One stream measured 480 MB/s on 5 GB checkpoints — the line,
+not rsync, so `pull` does not parallelise.
 
 ## 3. Environment and pre-flight (Hangang)
 
