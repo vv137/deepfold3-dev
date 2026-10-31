@@ -609,7 +609,10 @@ def _parse_inputs_file(path: Path, output_template: str, params: Path) -> list[t
     show_default=True,
     help=(
         "With --restraint-after-step, stop pushing below this σ̂ so the rest of the schedule "
-        "is pure denoising: it repairs what the push broke. The default is σ_data."
+        "is pure denoising and repairs what the push broke; σ_data by default. The last step "
+        "never pushes whatever this is set to, so the structure returned is always a denoiser "
+        "output. Set it low to hold the placement to the end: letting go at σ̂ = 16 left 68 "
+        "steps in which the model walked 7uvs all the way back (fnat 0.42 → 0.000)."
     ),
 )
 @click.option(

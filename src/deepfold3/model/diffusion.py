@@ -1404,7 +1404,16 @@ class DiffusionHead(nn.Module):
                     # Same positions_hat → all predictions share the augmented frame.
                     den_u = self._denoise_samples(positions_hat, sigma_hat, static_bs=static_u_bs)
                     denoised = denoised + (w - 1.0) * (den_c - den_u)
-            if restraints and restraint_weight and not restraint_after_step:
+            # Steering the prediction and pushing the coordinates are not
+            # alternatives, they are two halves of the schedule. Pushing holds
+            # the placement hardest (7uvs fnat 0.545 against 0.424) but leaves
+            # the surroundings rough (iRMSD 7.4 against 6.3, ICS 0.07 against
+            # 0.16), because the model gets less room to repair. So when
+            # --restraint-after-step is on, the push runs while sigma_hat is
+            # above the gate and this branch takes over below it: hold the
+            # chain where it belongs early, then negotiate the details.
+            steer = not restraint_after_step or sig_hat_host_all[step] < restraint_after_sigma
+            if restraints and restraint_weight and steer:
                 # Steer the predicted clean structure, not the noisy positions:
                 # D is what the Euler step aims at, so pulling it into the
                 # restraint moves the trajectory without adding noise of its
@@ -1447,7 +1456,13 @@ class DiffusionHead(nn.Module):
                 # pushing and the remaining steps are pure denoising, which
                 # repairs what the push broke and leaves the final structure a
                 # model output rather than a shoved one.
-                if sig_hat_host_all[step] >= restraint_after_sigma:
+                # Never on the last step: whatever the gate says, the final
+                # update is then a denoiser output, so the structure the caller
+                # gets is one the model signed off on. At that sigma_hat the
+                # model polishes rather than relocates, so holding the chain
+                # until then costs nothing and the placement survives.
+                last = step == cfg.steps - 1
+                if sig_hat_host_all[step] >= restraint_after_sigma and not last:
                     active = active_restraints(restraints, sig_hat_host_all[step])
                     if active:
                         sharp = 0.25 + 1.75 * (1.0 - min(sig_hat_host_all[step] / cfg.sigma_data, 1.0))
