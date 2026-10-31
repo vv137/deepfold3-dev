@@ -44,17 +44,23 @@ MIN_DISTANCE, MAX_DISTANCE = 2.0, 30.0
 
 @dataclass(frozen=True)
 class RestraintSpec:
-    """One parsed ``--restraint`` value, before chain names are resolved.
+    """One parsed restraint value, before chain names are resolved.
 
     Attributes:
         groups: The two selectors; the left one's residues are restrained.
         distance: The flat bottom, in A.
         sigma_range: ``(lo, hi)`` in absolute sigma-hat, or ``None`` for every step.
+        paired: Pair the selectors residue by residue, in the order written,
+            instead of restraining each left residue to the right group.
+        repel: Push apart instead of together: penalise distances BELOW
+            ``distance`` rather than above it.
     """
 
     groups: tuple[ChainSel, ChainSel]
     distance: float = DEFAULT_DISTANCE
     sigma_range: tuple[float, float] | None = None
+    paired: bool = False
+    repel: bool = False
 
 
 @dataclass(frozen=True)
@@ -74,9 +80,11 @@ class Restraint:
     sigma_range: tuple[float, float] | None = None
     chain_a: torch.Tensor | None = None  # [N] bool: all of the left selector's chain
     chain_b: torch.Tensor | None = None  # [N] bool: all of the right selector's chain
+    pair_index: tuple[tuple[int, int], ...] = ()  # token pairs, when paired
+    repel: bool = False
 
 
-def parse_restraint_spec(text: str) -> RestraintSpec:
+def parse_restraint_spec(text: str, paired: bool = False, repel: bool = False) -> RestraintSpec:
     """Parse ``SEL:SEL[@DIST[@LO..HI]]``.
 
     Args:
@@ -103,14 +111,32 @@ def parse_restraint_spec(text: str) -> RestraintSpec:
     if not MIN_DISTANCE <= distance <= MAX_DISTANCE:
         raise ValueError(f"restraint distance must be {MIN_DISTANCE:g}..{MAX_DISTANCE:g} A, got {distance:g}")
     sigma_range = _parse_sigma_range(fields[2]) if len(fields) > 2 else None
-    return RestraintSpec((a, b), distance, sigma_range)
+    if paired:
+        na, nb = _count(a), _count(b)
+        if not (na and nb):
+            raise ValueError(f"a paired restraint needs residues on both sides, got {fields[0]!r}")
+        if na != nb:
+            raise ValueError(f"paired selectors must name the same number of residues, got {na} and {nb}")
+    return RestraintSpec((a, b), distance, sigma_range, paired, repel)
+
+
+def _count(sel: ChainSel) -> int:
+    """How many residues a selector names; 0 for a whole chain."""
+    return sum(hi - lo + 1 for lo, hi in sel.ranges)
+
+
+def _residues(sel: ChainSel) -> list[int]:
+    """The residue numbers a selector names, in the order written."""
+    return [n for lo, hi in sel.ranges for n in range(lo, hi + 1)]
 
 
 def describe_restraint(spec: RestraintSpec) -> str:
     """One line for the run log and the manifest."""
     a, b = spec.groups
     sigma = f" σ∈[{spec.sigma_range[0]:g}, {spec.sigma_range[1]:g}]" if spec.sigma_range else ""
-    return f"{a}:{b} ≤ {spec.distance:g} Å{sigma}"
+    op = "≥" if spec.repel else "≤"
+    kind = f" ({_count(a)} pairs)" if spec.paired else ""
+    return f"{a}:{b} {op} {spec.distance:g} Å{kind}{sigma}"
 
 
 def build_restraints(
@@ -141,8 +167,48 @@ def build_restraints(
         # The whole chain of each side, for the rigid mode: the restraint names
         # residues, but what moves as one body is the chain they sit on.
         whole = [_sel_mask(ChainSel(sel.chain), asym_id, chain_index, None, n_tokens) for sel in spec.groups]
-        out.append(Restraint(a, b, spec.distance, spec.sigma_range, whole[0], whole[1]))
+        pair_index: tuple[tuple[int, int], ...] = ()
+        if spec.paired:
+            pair_index = _pair_tokens(spec, asym_id, chain_index, residue_index, n_tokens)
+        out.append(Restraint(a, b, spec.distance, spec.sigma_range, whole[0], whole[1], pair_index, spec.repel))
     return tuple(out)
+
+
+def _pair_tokens(
+    spec: RestraintSpec,
+    asym_id: torch.Tensor,
+    chain_index: Mapping[str, int],
+    residue_index: torch.Tensor | None,
+    n_tokens: int | None,
+) -> tuple[tuple[int, int], ...]:
+    """Token index for each written residue, zipped into pairs.
+
+    A paired restraint says which residue touches which, so the two selectors
+    are read in the order written and matched position by position. A residue
+    the input does not have is an error rather than a silent shift of the rest
+    of the pairing — getting the k-th pair wrong would mis-state every pair
+    after it.
+    """
+    import torch
+
+    if residue_index is None:
+        raise ValueError("a paired restraint needs the input's residue_index, got none")
+    picked = []
+    for sel in spec.groups:
+        if sel.chain not in chain_index:
+            raise ValueError(f"unknown chain {sel.chain!r}, this input has {sorted(chain_index)}")
+        in_chain = asym_id == chain_index[sel.chain]
+        if n_tokens is not None:
+            in_chain = in_chain.clone()
+            in_chain[n_tokens:] = False
+        idx = []
+        for num in _residues(sel):
+            hit = torch.nonzero(in_chain & (residue_index == num), as_tuple=False).flatten()
+            if not hit.numel():
+                raise ValueError(f"{sel.chain}/{num} is not a residue of this input")
+            idx.append(int(hit[0]))  # a residue is one token unless it was atomised
+        picked.append(idx)
+    return tuple(zip(*picked, strict=True))
 
 
 def _soft_min(d: torch.Tensor, sharpness: float) -> torch.Tensor:
@@ -193,25 +259,52 @@ def restraint_gradient(
         x = torch.empty_like(positions).copy_(positions).requires_grad_(True)
     with torch.inference_mode(False), torch.enable_grad():
         energy = x.new_zeros(())
+        flat = x.reshape(*x.shape[:-3], -1, 3)
+        m = x.shape[-2]
+        flat_mask = atom_mask.reshape(-1)
         for r in restraints:
-            rows = (r.tokens_a.unsqueeze(-1) & atom_mask).reshape(-1)  # [N*M]
-            cols = (r.tokens_b.unsqueeze(-1) & atom_mask).reshape(-1)
-            if not (bool(rows.any()) and bool(cols.any())):
-                continue
-            flat = x.reshape(*x.shape[:-3], -1, 3)
-            a = flat[..., rows, :]  # [..., A, 3]
-            b = flat[..., cols, :]  # [..., B, 3]
-            d = torch.cdist(a, b)  # [..., A, B]
-            # Soft minimum over the other group, then over each residue's atoms.
-            # A softmax-weighted mean of the distances, NOT -logsumexp(-λd)/λ:
-            # the latter sits below the true minimum by ln(count)/λ, so a group
-            # of many atoms would read as satisfied while it is still ln(count)/λ
-            # too far away, and the bias would grow with the selection's size.
-            token_of_row = torch.nonzero(rows, as_tuple=False).squeeze(-1) // x.shape[-2]
-            per_atom = _soft_min(d, sharpness)  # [..., A]
-            per_res = [_soft_min(per_atom[..., token_of_row == t], sharpness) for t in torch.unique(token_of_row)]
-            dist = torch.stack(per_res, dim=-1)  # [..., R]
-            energy = energy + (torch.clamp(dist - r.distance, min=0.0) ** 2).sum()
+            if r.pair_index:
+                # Residue to residue: the distance between THIS pair, not to
+                # the other group. A group restraint says "be near that chain",
+                # which a wrong pose satisfies — on 7uvs half the native
+                # epitope sits inside 6 Å of the antibody while fnat is 0.000.
+                # Naming the partner is what fixes the orientation, and three
+                # well-separated pairs already pin all six rigid freedoms.
+                dists = []
+                for ta, tb in r.pair_index:
+                    ra = flat_mask.new_zeros(flat_mask.shape)
+                    rb = flat_mask.new_zeros(flat_mask.shape)
+                    ra[ta * m : (ta + 1) * m] = atom_mask[ta]
+                    rb[tb * m : (tb + 1) * m] = atom_mask[tb]
+                    if not (bool(ra.any()) and bool(rb.any())):
+                        continue
+                    d = torch.cdist(flat[..., ra, :], flat[..., rb, :])
+                    dists.append(_soft_min(_soft_min(d, sharpness), sharpness))
+                if not dists:
+                    continue
+                dist = torch.stack(dists, dim=-1)
+            else:
+                rows = (r.tokens_a.unsqueeze(-1) & atom_mask).reshape(-1)  # [N*M]
+                cols = (r.tokens_b.unsqueeze(-1) & atom_mask).reshape(-1)
+                if not (bool(rows.any()) and bool(cols.any())):
+                    continue
+                a = flat[..., rows, :]  # [..., A, 3]
+                b = flat[..., cols, :]  # [..., B, 3]
+                d = torch.cdist(a, b)  # [..., A, B]
+                # Soft minimum over the other group, then over each residue's
+                # atoms. A softmax-weighted mean of the distances, NOT
+                # -logsumexp(-λd)/λ: the latter sits below the true minimum by
+                # ln(count)/λ, so a group of many atoms would read as satisfied
+                # while it is still ln(count)/λ too far away, and the bias would
+                # grow with the selection's size.
+                token_of_row = torch.nonzero(rows, as_tuple=False).squeeze(-1) // m
+                per_atom = _soft_min(d, sharpness)  # [..., A]
+                per_res = [_soft_min(per_atom[..., token_of_row == t], sharpness) for t in torch.unique(token_of_row)]
+                dist = torch.stack(per_res, dim=-1)  # [..., R]
+            # Repel penalises coming closer than the bound; the default
+            # penalises staying further than it.
+            gap = (r.distance - dist) if r.repel else (dist - r.distance)
+            energy = energy + (torch.clamp(gap, min=0.0) ** 2).sum()
         if not energy.requires_grad:
             # Every restraint is already satisfied, so the clamp cut the graph.
             return torch.zeros_like(positions)
