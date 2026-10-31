@@ -929,3 +929,68 @@ def test_rigid_step_is_capped():
     for cap in (0.5, 2.0):
         d = rigid_displacement(pos, mask, r, weight=10.0, sharpness=1.0, max_step=cap)
         assert float(d.norm(dim=-1).max()) <= cap * 2 + 1e-4  # translation + rotation arc
+
+
+def _pair(text: str):
+    from deepfold3.model.restraints import parse_restraint_spec
+
+    return parse_restraint_spec(text, paired=True)
+
+
+def test_paired_restraint_syntax():
+    from deepfold3.model.restraints import describe_restraint
+
+    spec = _pair("C/118+120+145:A/31+52+101@5")
+    assert spec.paired and spec.distance == 5.0
+    assert describe_restraint(spec) == "C/118+120+145:A/31+52+101 ≤ 5 Å (3 pairs)"
+
+
+@pytest.mark.parametrize("text", ["A:B", "A/2-3:B", "A:B/1", "A/2-3:B/1", "A/1+2:B/1+2+3"])
+def test_paired_restraint_needs_matching_residues(text):
+    with pytest.raises(ValueError):
+        _pair(text)
+
+
+def test_paired_restraint_pulls_the_named_partners():
+    """A group restraint cannot say which residue meets which; this can."""
+    from deepfold3.model.restraints import build_restraints, restraint_gradient
+
+    pos, mask, asym, res = _two_chains(30.0)
+    r = build_restraints([_pair("A/2+3:B/1+2@5")], asym, {"A": 0, "B": 1}, residue_index=res)
+    assert r[0].pair_index == ((1, 3), (2, 4))
+    g = restraint_gradient(pos, mask, r, sharpness=1.0)
+    per_token = g.norm(dim=-1).sum(-1).squeeze(0)
+    assert float(per_token[0]) == 0.0  # residue 1 of A is in neither pair
+    assert all(float(per_token[i]) > 0 for i in (1, 2, 3, 4))
+
+
+def test_paired_restraint_rejects_a_missing_residue():
+    from deepfold3.model.restraints import build_restraints
+
+    _, _, asym, res = _two_chains(30.0)
+    with pytest.raises(ValueError, match="not a residue"):
+        build_restraints([_pair("A/2+99:B/1+2@5")], asym, {"A": 0, "B": 1}, residue_index=res)
+
+
+def test_repel_pushes_apart_below_the_bound_only():
+    from deepfold3.model.restraints import build_restraints, parse_restraint_spec, restraint_gradient
+
+    def grad(sep: float, bound: float):
+        pos, mask, asym, res = _two_chains(sep)
+        spec = parse_restraint_spec(f"A/1:B@{bound:g}", repel=True)
+        r = build_restraints([spec], asym, {"A": 0, "B": 1}, residue_index=res)
+        return restraint_gradient(pos, mask, r, sharpness=1.0)
+
+    assert float(grad(30.0, 20.0).abs().max()) == 0.0  # already further than the bound
+    g = grad(10.0, 20.0)
+    pos, mask, asym, res = _two_chains(10.0)
+    moved = pos - 0.05 * g
+    before = float(pos[0, 3, 0, 0] - pos[0, 0, 0, 0])
+    after = float(moved[0, 3, 0, 0] - moved[0, 0, 0, 0])
+    assert after > before  # pushed apart
+
+
+def test_repel_reads_in_the_description():
+    from deepfold3.model.restraints import describe_restraint, parse_restraint_spec
+
+    assert describe_restraint(parse_restraint_spec("A/5-9:B@12", repel=True)) == "A/5-9:B ≥ 12 Å"

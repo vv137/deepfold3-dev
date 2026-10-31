@@ -1229,6 +1229,8 @@ class DiffusionHead(nn.Module):
         restraint_weight: float = 0.0,
         restraint_rigid: bool = True,
         restraint_max_step: float = 2.0,
+        restraint_after_step: bool = False,
+        restraint_after_sigma: float = 16.0,
     ) -> dict[str, torch.Tensor]:
         """Draw samples from the diffusion model (Euler-Maruyama sampler).
 
@@ -1283,6 +1285,8 @@ class DiffusionHead(nn.Module):
                 restraint_weight=restraint_weight,
                 restraint_rigid=restraint_rigid,
                 restraint_max_step=restraint_max_step,
+                restraint_after_step=restraint_after_step,
+                restraint_after_sigma=restraint_after_sigma,
             )
 
     def _sample_impl(
@@ -1302,6 +1306,8 @@ class DiffusionHead(nn.Module):
         restraint_weight: float = 0.0,
         restraint_rigid: bool = True,
         restraint_max_step: float = 2.0,
+        restraint_after_step: bool = False,
+        restraint_after_sigma: float = 16.0,
     ) -> dict[str, torch.Tensor]:
         cfg = self.cfg
         N, M = ref_mask.shape[-2:]
@@ -1398,7 +1404,7 @@ class DiffusionHead(nn.Module):
                     # Same positions_hat → all predictions share the augmented frame.
                     den_u = self._denoise_samples(positions_hat, sigma_hat, static_bs=static_u_bs)
                     denoised = denoised + (w - 1.0) * (den_c - den_u)
-            if restraints and restraint_weight:
+            if restraints and restraint_weight and not restraint_after_step:
                 # Steer the predicted clean structure, not the noisy positions:
                 # D is what the Euler step aims at, so pulling it into the
                 # restraint moves the trajectory without adding noise of its
@@ -1428,6 +1434,37 @@ class DiffusionHead(nn.Module):
                         denoised = denoised + move * (restraint_max_step / norm.clamp(min=restraint_max_step))
             d_t = sigma_next - sigma_hat
             positions = positions_hat + cfg.step_scale * d_t * (positions_hat - denoised) / sigma_hat
+
+            if restraints and restraint_weight and restraint_after_step:
+                # Push the trajectory itself rather than the prediction it aims
+                # at. Steering ``denoised`` passes through the Euler
+                # coefficient (step_scale*|d_t|/sigma_hat, ~0.7 over most of the
+                # schedule) and the next denoiser call is free to put the chain
+                # back; this is not negotiable with the model. It is therefore
+                # also unsupervised: the restraint knows nothing about clashes,
+                # so a rigid push can drive two chains into each other. Hence
+                # the gate — below ``restraint_after_sigma`` the loop stops
+                # pushing and the remaining steps are pure denoising, which
+                # repairs what the push broke and leaves the final structure a
+                # model output rather than a shoved one.
+                if sig_hat_host_all[step] >= restraint_after_sigma:
+                    active = active_restraints(restraints, sig_hat_host_all[step])
+                    if active:
+                        sharp = 0.25 + 1.75 * (1.0 - min(sig_hat_host_all[step] / cfg.sigma_data, 1.0))
+                        if restraint_rigid:
+                            positions = positions + rigid_displacement(
+                                positions,
+                                ref_mask.bool(),
+                                active,
+                                weight=restraint_weight,
+                                sharpness=sharp,
+                                max_step=restraint_max_step,
+                            )
+                        else:
+                            grad = restraint_gradient(positions, ref_mask.bool(), active, sharpness=sharp)
+                            move = -0.5 * restraint_weight * grad
+                            norm = move.norm(dim=-1, keepdim=True)
+                            positions = positions + move * (restraint_max_step / norm.clamp(min=restraint_max_step))
 
         mask_expanded = ref_mask.unsqueeze(-3).expand(*batch_shape, cfg.num_samples, N, M)
         return {

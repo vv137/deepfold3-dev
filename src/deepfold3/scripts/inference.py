@@ -85,6 +85,20 @@ def _parse_restraints(_ctx, _param, values: tuple[str, ...]) -> tuple[RestraintS
         raise click.BadParameter(str(e)) from e
 
 
+def _parse_restraint_pairs(_ctx, _param, values: tuple[str, ...]) -> tuple[RestraintSpec, ...]:
+    try:
+        return tuple(parse_restraint_spec(v, paired=True) for v in values)
+    except ValueError as e:
+        raise click.BadParameter(str(e)) from e
+
+
+def _parse_repels(_ctx, _param, values: tuple[str, ...]) -> tuple[RestraintSpec, ...]:
+    try:
+        return tuple(parse_restraint_spec(v, repel=True) for v in values)
+    except ValueError as e:
+        raise click.BadParameter(str(e)) from e
+
+
 def _describe_guidance(spec: GuidanceSpec) -> str:
     target = ",".join(f"{a}:{b}" for a, b in spec.pairs) or spec.target
     sigma = f" σ∈[{spec.sigma_range[0]:g}, {spec.sigma_range[1]:g}]" if spec.sigma_range else ""
@@ -296,10 +310,57 @@ def _save_logits(save, path: Path, *args, **kwargs) -> None:
     ),
 )
 @click.option(
+    "--restraint-after-step/--restraint-before-step",
+    default=False,
+    show_default=True,
+    help=(
+        "Where the restraint acts. Before (default): it moves the predicted clean structure, "
+        "so the Euler step carries ~70 % of it and the next denoiser call may put the chain "
+        "back — the restraint competes with the model and the final structure is a model "
+        "output. After: it moves the coordinates themselves, which the model cannot undo, and "
+        "which nothing supervises — a rigid push knows nothing about clashes."
+    ),
+)
+@click.option(
+    "--restraint-after-sigma",
+    default=16.0,
+    show_default=True,
+    help=(
+        "With --restraint-after-step, stop pushing below this σ̂ so the rest of the schedule "
+        "is pure denoising: it repairs what the push broke. The default is σ_data."
+    ),
+)
+@click.option(
     "--restraint-max-step",
     default=2.0,
     show_default=True,
     help="Å cap on the displacement one sampler step may apply per restraint (steering needs the clip).",
+)
+@click.option(
+    "--restraint-pair",
+    "restraint_pair_specs",
+    multiple=True,
+    metavar="SEL:SEL[@DIST[@LO..HI]]",
+    callback=_parse_restraint_pairs,
+    help=(
+        "Residue-to-residue restraint: the selectors are read in the order written and "
+        "matched position by position (C/118+120+145:A/31+52+101 is three pairs), so both "
+        "sides must name the same number of residues. Unlike --restraint this fixes WHICH "
+        "residue touches which, which is what orients a chain on a site: three well-separated "
+        "pairs pin all six rigid freedoms. Default bottom 6 Å; native contacts run 3.6 Å median, "
+        "so 4-5 is the useful range."
+    ),
+)
+@click.option(
+    "--repel",
+    "repel_specs",
+    multiple=True,
+    metavar="SEL:SEL[@DIST[@LO..HI]]",
+    callback=_parse_repels,
+    help=(
+        "The opposite bound: every residue of the left selector must stay at least DIST Å "
+        "from the right group. Use it to push a prediction off a site it keeps choosing."
+    ),
 )
 @click.option(
     "--restraint-weight",
@@ -362,9 +423,13 @@ def inference(
     guidance_specs: tuple[GuidanceSpec, ...],
     allow_guidance_overlap: bool,
     restraint_specs: tuple[RestraintSpec, ...],
+    restraint_pair_specs: tuple[RestraintSpec, ...],
+    repel_specs: tuple[RestraintSpec, ...],
     restraint_weight: float,
     restraint_rigid: bool,
     restraint_max_step: float,
+    restraint_after_step: bool,
+    restraint_after_sigma: float,
     hoist_sampler: bool,
     allow_missing_keys: bool,
     det: bool,
@@ -619,14 +684,15 @@ def inference(
         if has_residue_ranges(guidance_specs):
             click.echo("[inference] note: a residue-subset drop is finer than the training drop (whole chain pairs)")
 
+    all_restraint_specs = tuple(restraint_specs) + tuple(restraint_pair_specs) + tuple(repel_specs)
     restraints = ()
-    if restraint_specs:
+    if all_restraint_specs:
         from deepfold3.io.mmcif import resolve_chain_name
 
         chain_index = {resolve_chain_name(a, chain_names): a for a in feats["asym_id"][:original_n].unique().tolist()}
         try:
             restraints = build_restraints(
-                restraint_specs,
+                all_restraint_specs,
                 feats["asym_id"],
                 chain_index,
                 original_n,
@@ -636,7 +702,7 @@ def inference(
             raise click.UsageError(f"--restraint: {e}") from e
         click.echo(
             f"[inference] restraints (weight {restraint_weight:g}): "
-            + " + ".join(describe_restraint(r) for r in restraint_specs)
+            + " + ".join(describe_restraint(r) for r in all_restraint_specs)
         )
 
     # ------------------------------------------------------------------
@@ -734,6 +800,8 @@ def inference(
                         restraint_weight=restraint_weight,
                         restraint_rigid=restraint_rigid,
                         restraint_max_step=restraint_max_step,
+                        restraint_after_step=restraint_after_step,
+                        restraint_after_sigma=restraint_after_sigma,
                     )
 
                 iter_feats = feats

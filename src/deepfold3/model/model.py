@@ -938,6 +938,8 @@ class DeepFold3(nn.Module):
         restraint_weight: float = 0.0,
         restraint_rigid: bool = True,
         restraint_max_step: float = 2.0,
+        restraint_after_step: bool = False,
+        restraint_after_sigma: float = 16.0,
     ) -> DeepFold3Output:
         """Run full forward pass.
 
@@ -961,6 +963,12 @@ class DeepFold3(nn.Module):
                 than pulling the named residues alone
             restraint_max_step: angstrom cap on the displacement one step may
                 apply
+            restraint_after_step: move the coordinates after the Euler step
+                instead of the prediction before it, so the denoiser cannot
+                undo it
+            restraint_after_sigma: with ``restraint_after_step``, stop pushing
+                below this sigma-hat and let the tail of the schedule repair
+                and finish the structure
         """
         if num_recycles is None:
             num_recycles = self.cfg.num_recycles
@@ -996,6 +1004,8 @@ class DeepFold3(nn.Module):
                 restraint_weight=restraint_weight,
                 restraint_rigid=restraint_rigid,
                 restraint_max_step=restraint_max_step,
+                restraint_after_step=restraint_after_step,
+                restraint_after_sigma=restraint_after_sigma,
                 **self._ref_kwargs(features),
             )
 
