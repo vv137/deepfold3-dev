@@ -376,6 +376,38 @@ logits and atom AdaLN terms (`DiffusionTransformer.forward_hoisted`,
 `AtomCrossAttTransformer.forward_hoisted`), and shares one copy across samples. See
 `docs/optimizations.md` § _Diffusion sampler_.
 
+### Distance restraints (`model/restraints.py`)
+
+Restraints act on **coordinates inside the sampler**, not on the conditioning as
+`--guidance` does, and nothing was trained for them. Each is a flat-bottom
+penalty whose gradient is taken with autograd on a copy — under
+`inference_mode(False)`, because a tensor made under inference mode records no
+graph even inside `enable_grad`, and without that the restraint is a silent
+no-op:
+
+| CLI | energy | meaning |
+|---|---|---|
+| `--restraint A/25-40:B@6` | `Σ_i max(0, d_i − D)²` | every residue of the left selector must come within `D` Å of the right side, `d_i` a soft minimum over that side's atoms |
+| `--restraint-pair A/59+33:C/97+94@5` | the same, per **paired** residue | residue 59 to residue 97, 33 to 94; a group restraint is satisfiable by the wrong pose, a pairing is not |
+| `--repel A/12+15:B@8` | `Σ_i max(0, D − d_i)²` | the same with the sign reversed, so it stops pushing once the bound is cleared instead of driving the chains apart |
+
+The soft minimum is a softmax-weighted mean of the distances, **not**
+`−logsumexp(−λd)/λ`: the latter sits below the true minimum by `ln(count)/λ`, so
+a restraint on a large group would read as satisfied while still that far away
+and the bias would grow with the selection's size.
+
+`--restraint-rigid` (the default) projects the per-atom gradient onto the six
+rigid degrees of freedom of the chain it acts on, so the chain translates and
+rotates and its internal geometry is untouched; `--restraint-residues` pulls the
+named residues alone and stretches the chain where the selection ends.
+`--restraint-weight` is the fraction of the remaining violation removed per
+step and `--restraint-max-step` caps the displacement — there is no momentum in
+the loop, so nothing overshoots on its own and instability could only come from
+the step size. `@LO..HI` on a selector, or
+`--restraint-after-step --restraint-after-sigma`, limits the push to a σ̂ range;
+the last step never pushes, so the structure returned is always a denoiser
+output.
+
 ## Batch Dimension Support
 
 All core model modules support both unbatched and batched (leading B dim) inputs:
