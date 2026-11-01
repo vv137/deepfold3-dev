@@ -231,11 +231,16 @@ def test_dataset_config_exclude_loss_mol_types_default_empty():
     assert cfg.exclude_loss_mol_types == []
 
 
-def test_initial_yaml_patchr_exclude_loss_mol_types():
+def test_initial_yaml_exclude_loss_mol_types():
     """``configs/initial.yaml`` declares ``exclude_loss_mol_types`` per dataset.
 
-    Current policy: no datasets exclude any mol_type (PATCHR keeps ligand
+    Current policy: no dataset excludes any mol_type (PATCHR keeps ligand
     supervision). The field is still surfaced through the loader.
+
+    Asserted over whichever datasets the config enables, not over a named one:
+    the earlier version demanded ``patchr``, which is commented out in the
+    config on purpose until its template index frame is verified, so the test
+    failed for a reason that had nothing to do with loss masking.
     """
     from pathlib import Path
 
@@ -243,10 +248,9 @@ def test_initial_yaml_patchr_exclude_loss_mol_types():
 
     cfg = load_config(Path(__file__).parent.parent / "configs" / "initial.yaml")
     extras = cfg["training"]["extra_datasets"]
-    by_name = {d["name"]: d for d in extras}
-    assert by_name["patchr"]["exclude_loss_mol_types"] == []
-    assert by_name["long_monomers"]["exclude_loss_mol_types"] == []
-    assert by_name["short_monomers"]["exclude_loss_mol_types"] == []
+    assert extras, "initial.yaml enables no extra dataset, so the field is untested"
+    for d in extras:
+        assert d["exclude_loss_mol_types"] == [], d["name"]
 
 
 def test_distogram_gated_on_gt_rep_presence():
