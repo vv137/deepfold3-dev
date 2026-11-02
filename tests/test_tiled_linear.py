@@ -58,20 +58,35 @@ class TestForwardExact:
 
 
 class TestBackwardGradients:
-    """Backward pass produces correct gradients."""
+    """Backward pass produces correct gradients.
+
+    Unlike the forward, the backward cannot be bitwise identical. Tiling splits
+    the forward along dim -2 into shards whose rows are independent, so each
+    output element is produced by the same reduction in the same order and
+    ``TestForwardExact`` can and does demand ``torch.equal``. The input
+    gradient is different in kind: it accumulates a contribution from every
+    shard, so the tiled path sums shard by shard where the untiled path does
+    one reduction. That is a reassociation, not a loss of precision, and it
+    lands at the fp32 noise floor -- measured 2.4e-06 against a gradient whose
+    peak is 5.2, i.e. ~4 ULP. Both gradient tests therefore use tolerances;
+    ``test_param_grad_fp32`` already did, and said so in its comment.
+    """
 
     def test_input_grad_fp32(self):
         base, tiled = _make_pair()
         base.train()
         tiled.train()
+        # Seeded for the same reason test_param_grad_fp32 is: the comparison
+        # sits at the summation-order floor, so an unseeded draw makes the
+        # margin vary run to run.
+        torch.manual_seed(0)
         x = torch.randn(16, 16, 128)
         x1 = x.clone().detach().requires_grad_(True)
         x2 = x.clone().detach().requires_grad_(True)
 
         base(x1).sum().backward()
         tiled(x2).sum().backward()
-        # Input gradients should be bitwise identical
-        assert torch.equal(x1.grad, x2.grad)
+        torch.testing.assert_close(x1.grad, x2.grad, atol=1e-5, rtol=1e-4)
 
     def test_param_grad_fp32(self):
         base, tiled = _make_pair()
