@@ -48,6 +48,8 @@ export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export DF3_STOP_FILE="${RUN_DIR}/.stop-${SLURM_JOB_ID}"
 trap 'echo "USR1: walltime near, asking ranks to checkpoint"; touch "${DF3_STOP_FILE}" || true' USR1
 
+# checkpoint_every_hours is passed here, not read from the frozen config.yaml,
+# so a chain that froze an older value still gets it. EXTRA_ARGS can override.
 # --gres-flags=allow-task-sharing lets each task open all 4 GPUs of its node
 # (NCCL P2P / CUDA IPC between ranks); Slurm accepts it only on srun.
 srun --mpi=none --gpu-bind=none --gres-flags=allow-task-sharing --kill-on-bad-exit=1 \
@@ -59,6 +61,7 @@ srun --mpi=none --gpu-bind=none --gres-flags=allow-task-sharing --kill-on-bad-ex
     --ccd-cache "${DATA}/ccd_cache.json" \
     --mmcif-dir "${DATA}/pdb/divided" \
     --override auto_resume=true \
+    --override checkpoint_every_hours="${CKPT_HOURS:-1.0}" \
     ${EXTRA_ARGS:-} &
 SRUN_PID=$!
 set +e
