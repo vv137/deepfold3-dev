@@ -730,11 +730,18 @@ def test_extreme_attention_concentration():
 
     # Tight forward — winner-take-all is actually numerically easy (one dominant term).
     _assert_pass("extreme_attention_conc_fwd", params, m_fwd)
-    # Backward: in the saturated regime, softmax 1 - p(winner) -> 0 so dQ, dK,
-    # and most of d_pair_bias collapse to near zero. rel_err becomes meaningless
-    # (both kernel and ref at noise floor ~1e-7, below bf16 eps). Switch the
-    # gate to absolute-error-vs-input-scale: kernel must be within bf16 eps
-    # times a generous factor relative to input magnitude (~1 post-LN).
+    # Backward: in the saturated regime dQ, dK and most of d_pair_bias shrink
+    # to ~1e-7. That is NOT a noise floor — an fp64 oracle puts the true dQ at
+    # the same ~1.2e-7, so the 0.81 dQ fail_frac here is real signal loss
+    # (Softmax Collapse, arXiv:2610.31642 §2): the backward reads
+    # D = rowsum(dO * O) from the bf16-stored O, which rounds to V[winner]
+    # once the margin passes the bf16 cliff 5.5, zeroing dS at the winner
+    # slot. See tests/triton/test_evo_attn_softmax_collapse.py, which gates
+    # this against fp64 and is xfail until the kernel is fixed.
+    #
+    # This gate stays absolute-error-vs-input-scale so the suite keeps
+    # tracking gross breakage of the saturated path; it deliberately does not
+    # fail on the collapse, which the dedicated test above owns.
     bf16_eps = 2**-7  # ~7.8e-3 (mantissa 7 bits)
     abs_limit = bf16_eps * 10.0  # 10x eps cushion for accumulated block ops
     for n, m in m_bwd.items():
