@@ -40,6 +40,8 @@ try:
 except ImportError:
     HAS_TRITON = False
 
+from deepfold3.model import kernel_census
+from deepfold3.model.inference_guard import inference_only
 from deepfold3.model.triton import Precision
 
 logger = logging.getLogger(__name__)
@@ -136,6 +138,7 @@ def _precision(dtype: torch.dtype) -> int:
     return Precision.IEEE if torch.get_float32_matmul_precision() == "highest" else Precision.TF32x3
 
 
+@inference_only("fused_msa_transition")
 def fused_msa_transition(
     x: torch.Tensor,
     norm_weight: torch.Tensor,
@@ -163,14 +166,9 @@ def fused_msa_transition(
         ``[..., C]`` tensor; ``x`` itself when ``inplace``.
 
     Raises:
-        RuntimeError: If grad is enabled. This kernel has no backward.
+        InferenceOnlyKernelError: If grad is enabled. This kernel has no backward.
         ValueError: If the inputs are outside what the kernel supports.
     """
-    if torch.is_grad_enabled():
-        raise RuntimeError(
-            "fused_msa_transition is inference-only and has no backward: "
-            "call it under torch.no_grad() or torch.inference_mode()."
-        )
     if not HAS_TRITON:
         raise ValueError("fused_msa_transition requires triton")
     if inplace and residual_scale is None:
@@ -225,8 +223,6 @@ def fused_msa_transition(
 
 def msa_transition_unsupported(block: nn.Module, x: torch.Tensor) -> str | None:
     """Return why the kernel cannot serve ``block(x)`` in place, or None if it can."""
-    if torch.is_grad_enabled():
-        return "grad is enabled"
     if not HAS_TRITON:
         return "triton is not installed"
     if not x.is_cuda:
@@ -250,6 +246,7 @@ def msa_transition_unsupported(block: nn.Module, x: torch.Tensor) -> str | None:
     return None
 
 
+@inference_only("fused_msa_transition")
 def msa_transition_residual_(block: nn.Module, x: torch.Tensor, scale: float) -> torch.Tensor | None:
     """Apply ``x + scale * block(x)`` over ``x`` with the fused kernel.
 
@@ -262,11 +259,15 @@ def msa_transition_residual_(block: nn.Module, x: torch.Tensor, scale: float) ->
 
     Returns:
         The updated tensor, or None when the kernel cannot serve this call. The reason is
-        logged once per distinct reason and the caller takes the stock path. Errors from
-        the kernel itself, out-of-memory included, propagate.
+        logged once per distinct reason, counted in the kernel census, and the caller takes
+        the stock path. Errors from the kernel itself, out-of-memory included, propagate.
+
+    Raises:
+        InferenceOnlyKernelError: If grad is enabled. The flag must be off for training.
     """
     reason = msa_transition_unsupported(block, x)
     if reason is not None:
+        kernel_census.record("fused_msa_transition", f"refused:{reason}")
         if reason not in _warned:
             _warned.add(reason)
             logger.warning("use_fused_msa_transition_inference is on but using the stock path: %s", reason)

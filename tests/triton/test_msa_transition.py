@@ -14,6 +14,7 @@ import torch
 from deepfold3.model import optim as optim_module
 from deepfold3.model.config import OptimConfig
 from deepfold3.model.evoformer import EvoformerBlock
+from deepfold3.model.inference_guard import InferenceOnlyKernelError
 from deepfold3.model.primitives import TransitionBlock
 from deepfold3.model.triton import msa_transition as mt
 
@@ -97,25 +98,12 @@ def test_flag_off_is_identical_to_stock_statement():
     assert torch.equal(out, captured["x"] + block.residual_out_scale * captured["o"])
 
 
-def test_gradients_identical_with_flag_on(monkeypatch):
-    monkeypatch.setattr(mt, "_warned", set())
-    off, on = _run_block(False, grad=True), _run_block(True, grad=True)
-    for a, b in zip(off, on, strict=True):
-        assert torch.equal(a, b)
-
-
-def test_grad_enabled_stays_on_stock_path_with_flag_on(monkeypatch):
-    monkeypatch.setattr(mt, "_warned", set())
-
-    def boom(*args, **kwargs):
-        raise AssertionError("kernel reached with grad enabled")
-
-    monkeypatch.setattr(mt, "fused_msa_transition", boom)
+def test_grad_enabled_is_refused_with_flag_on():
+    """The flag is inference-only: training must not reach it, not silently fall back."""
     block = _evoformer_block(OptimConfig(use_fused_msa_transition_inference=True))
     msa = torch.randn(1, 3, 8, 64, requires_grad=True)
-    out, _ = block(msa, torch.randn(1, 8, 8, 32), torch.ones(1, 3, 8), torch.ones(1, 8, 8))
-    out.sum().backward()
-    assert msa.grad is not None
+    with pytest.raises(InferenceOnlyKernelError, match="fused_msa_transition"):
+        block(msa, torch.randn(1, 8, 8, 32), torch.ones(1, 3, 8), torch.ones(1, 8, 8))
 
 
 def test_fallback_reason_logged_once(monkeypatch, caplog):

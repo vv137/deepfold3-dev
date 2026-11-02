@@ -802,3 +802,7 @@ benchmarks/
 ## Kernel census
 
 `OptimConfig` records what was requested, not what ran. `model/kernel_census.py` tallies the path each dispatch site took, and `inference` / `inference-batch` write it to `run_manifest.json` as `kernels` (`{site: {path: count}}`) with `kernels_shadowed`, the levers that were enabled but never reached. Read those fields, not the preset name, to establish which kernels produced a result. `use_fused_ln_transpose` is the standing example: `use_fused_pair_bias` is tested first and every preset that enables the former enables the latter, so `inference()` builds that kernel and never runs it. Adding a dispatch branch means adding a `kernel_census.record` call to it.
+
+## Inference-only kernels refuse
+
+An inference-only kernel carries `@inference_only(...)` from `model/inference_guard.py`: with grad enabled it raises `InferenceOnlyKernelError` instead of falling back, so training cannot reach it through a flag. A kernel that cannot serve a call for another reason says so through the census (`refused:<reason>`), so the reason reaches `run_manifest.json`. `use_fused_msa_transition_inference` follows this; `OuterProductMean._project_rows` and `map_row_chunks` still take their plain path under grad.
