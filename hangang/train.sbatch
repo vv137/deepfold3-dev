@@ -40,11 +40,13 @@ if (( SLURM_JOB_NUM_NODES > 1 )); then
 fi
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 
-# 10 min before the walltime Slurm sends USR1 to this script; forward it as
-# SIGTERM through srun. The trainer's ShutdownCoordinator then stops all ranks
-# at the same microstep and writes checkpoint_<step>.pt, which the next chain
-# link resumes from.
-trap 'echo "USR1: walltime near, asking ranks to checkpoint"; kill -TERM "${SRUN_PID}" 2>/dev/null || true' USR1
+# 10 min before the walltime Slurm sends USR1 to this script; it creates the
+# stop file. Rank 0 sees it on its next microstep, the trainer's
+# ShutdownCoordinator stops all ranks at that microstep and writes
+# checkpoint_<step>.pt, which the next chain link resumes from. Do not send
+# SIGTERM to srun here: srun cancels the step and SIGKILLs the ranks ~30 s later.
+export DF3_STOP_FILE="${RUN_DIR}/.stop-${SLURM_JOB_ID}"
+trap 'echo "USR1: walltime near, asking ranks to checkpoint"; touch "${DF3_STOP_FILE}" || true' USR1
 
 # --gres-flags=allow-task-sharing lets each task open all 4 GPUs of its node
 # (NCCL P2P / CUDA IPC between ranks); Slurm accepts it only on srun.
@@ -67,4 +69,5 @@ while kill -0 "${SRUN_PID}" 2>/dev/null; do
     wait "${SRUN_PID}"
     rc=$?
 done
+rm -f "${DF3_STOP_FILE}"
 exit "${rc}"

@@ -2,9 +2,10 @@
 
 Two tiny helpers:
 
-* :class:`ShutdownCoordinator` owns the SIGTERM/SIGINT handlers and a
-  per-microstep collective (``MAX`` all_reduce) that propagates one
-  rank's shutdown request to every peer.
+* :class:`ShutdownCoordinator` owns the SIGTERM/SIGINT handlers, the
+  ``DF3_STOP_FILE`` poll on rank 0, and a per-microstep collective
+  (``MAX`` all_reduce) that propagates one rank's shutdown request to
+  every peer.
 * :class:`CheckpointRequestHandler` owns the SIGUSR2 handler for
   "please checkpoint now" signals (used by SLURM preemption hooks and
   manual ``kill -USR2``).
@@ -16,6 +17,7 @@ Kept in a dedicated module so the collective contract (MAX over a
 from __future__ import annotations
 
 import logging
+import os
 import platform
 import signal
 
@@ -36,11 +38,17 @@ class ShutdownCoordinator:
     runs EVERY microstep (cheap 1-elem all_reduce on a preallocated
     buffer) so all ranks bail together rather than waiting for the next
     opt-step boundary.
+
+    ``DF3_STOP_FILE``, when set, names a file whose appearance requests the
+    same shutdown. Rank 0 polls it in :meth:`tick`. A batch script cannot use
+    SIGTERM for this under srun: signalling srun cancels the step, and
+    signalling the step also reaches DataLoader workers and the wandb service.
     """
 
     def __init__(self, dist_info: DistInfo) -> None:
         self.dist = dist_info
         self.requested = False
+        self._stop_file = os.environ.get("DF3_STOP_FILE")
         self._flag = torch.zeros(1, dtype=torch.int32, device=dist_info.device)
         if platform.system() != "Windows":
             signal.signal(signal.SIGTERM, lambda *_: self._set())
@@ -54,6 +62,9 @@ class ShutdownCoordinator:
 
         Must be called by every rank in lockstep on every microstep.
         """
+        if self._stop_file and self.dist.is_main and not self.requested and os.path.exists(self._stop_file):
+            logger.info(f"Stop file {self._stop_file} found, shutting down")
+            self.requested = True
         if self.dist.is_distributed:
             self._flag.fill_(int(self.requested))
             dist.all_reduce(self._flag, op=dist.ReduceOp.MAX)

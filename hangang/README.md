@@ -26,6 +26,7 @@ local (source host)                          Hangang
 | `submit.sh` + `train.sbatch` | Hangang | training as a chain of 24 h jobs with auto-resume |
 | `keepalive.sh` | Hangang | report files close to the 15-day purge (optionally refresh atime) |
 | `smoke_data.py` | (called by `check.sbatch`) | builds the real DataLoader from a config and times it |
+| `smoke_walltime.sh` | login node | 2-node, 2-link test that the walltime checkpoint is written and resumed |
 
 ## 1. Build the packed tree (source host)
 
@@ -122,9 +123,12 @@ NODES=16 EXTRA_ARGS="--wandb deepfold3-stage0" bash hangang/submit.sh df3-hangan
 
 `train.sbatch` writes `$RUNS/<run>/config.yaml` once (from `configs/initial.yaml`
 with `/data/` → `$DATA/`) and every link reuses it. Ten minutes before the
-walltime the job asks the ranks to checkpoint (SIGTERM → `ShutdownCoordinator`);
+walltime the job asks the ranks to checkpoint (stop file → `ShutdownCoordinator`);
 the next link resumes from the newest checkpoint (`train.sbatch` forces
 `auto_resume=true`; the configs default it to false).
+Before changing this path, run `hangang/smoke_walltime.sh`. Signalling srun does
+not work: it cancels the step, the ranks are killed about 30 s later, and every
+link through job 1179296 fell back to its last regular checkpoint.
 
 Starting from another run's weights, with a different seed:
 

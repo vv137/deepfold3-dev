@@ -7,8 +7,10 @@ import torch
 import torch.nn as nn
 
 from deepfold3.model.config import TrainingConfig
+from deepfold3.training.distributed import DistInfo
 from deepfold3.training.ema import EMA
 from deepfold3.training.scheduler import AF3LRScheduler, WSDSScheduler, build_scheduler
+from deepfold3.training.signals import ShutdownCoordinator
 
 
 def _simple_model():
@@ -1345,3 +1347,27 @@ class TestSchedulerResumeOverride:
 
         src = inspect.getsource(Trainer._run_inner)
         assert "_SCHEDULER_CFG_FIELDS" in src, "resume path no longer forces the yaml schedule"
+
+
+class TestShutdownStopFile:
+    @staticmethod
+    def _dist(rank: int = 0):
+        return DistInfo(rank=rank, world_size=1, local_rank=0, device=torch.device("cpu"))
+
+    def test_stop_file_requests_shutdown(self, tmp_path, monkeypatch):
+        stop = tmp_path / ".stop"
+        monkeypatch.setenv("DF3_STOP_FILE", str(stop))
+        shutdown = ShutdownCoordinator(self._dist())
+        assert shutdown.tick() is False
+        stop.touch()
+        assert shutdown.tick() is True
+
+    def test_only_rank_zero_polls(self, tmp_path, monkeypatch):
+        stop = tmp_path / ".stop"
+        stop.touch()
+        monkeypatch.setenv("DF3_STOP_FILE", str(stop))
+        assert ShutdownCoordinator(self._dist(rank=1)).tick() is False
+
+    def test_unset_is_inert(self, monkeypatch):
+        monkeypatch.delenv("DF3_STOP_FILE", raising=False)
+        assert ShutdownCoordinator(self._dist()).tick() is False

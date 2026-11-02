@@ -811,7 +811,7 @@ class Trainer:
         gn_global_count = 0
 
         # SIGUSR2 → request immediate checkpoint (preemption safety)
-        # SIGTERM/SIGINT → checkpoint + graceful exit (SLURM preemption, kill, Ctrl+C)
+        # SIGTERM/SIGINT/DF3_STOP_FILE → checkpoint + graceful exit (SLURM walltime, kill, Ctrl+C)
         shutdown = ShutdownCoordinator(self.dist)
         ckpt_request = CheckpointRequestHandler()
 
