@@ -49,14 +49,8 @@ def test_kernel_raises_with_grad_enabled():
 
 def test_flag_only_on_in_inference_preset():
     assert OptimConfig.inference().use_fused_msa_transition_inference
-    for preset in (
-        OptimConfig,
-        OptimConfig.recommended,
-        OptimConfig.recommended_tiled,
-        OptimConfig.triton_only,
-        OptimConfig.all_enabled,
-    ):
-        assert not preset().use_fused_msa_transition_inference
+    assert not OptimConfig().use_fused_msa_transition_inference
+    assert not OptimConfig.none().use_fused_msa_transition_inference
 
 
 def test_state_dict_keys_unchanged_by_flag():
@@ -135,7 +129,7 @@ def test_make_transition_block_unchanged():
     """The kernel is wired in EvoformerBlock only: pair and template blocks never see it."""
     cfg = OptimConfig.inference()
     assert type(optim_module.make_transition_block(128, config=cfg)) is type(
-        optim_module.make_transition_block(128, config=OptimConfig.recommended())
+        optim_module.make_transition_block(128, config=OptimConfig(use_fused_transition_pair=True))
     )
 
 

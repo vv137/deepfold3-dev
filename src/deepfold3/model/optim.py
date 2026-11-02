@@ -12,9 +12,11 @@ from functools import lru_cache
 
 import torch.nn as nn
 
+from deepfold3.model import kernel_census
 from deepfold3.model.config import OptimConfig
 
-# Pair channel dim where fused transition is used (C=128 pair, M=N² → Triton wins).
+# Dims where the fused transition is used. The gate is by channel count, not by
+# role, so it serves the C=128 MSA and template blocks and misses C=256 pair blocks.
 _PAIR_TRANSITION_CHANNELS = (64, 128)
 # Single/MSA channel dims where fused transition is slow (M=N, small → PyTorch wins).
 _SINGLE_TRANSITION_CHANNELS = (384,)
@@ -66,6 +68,10 @@ def make_transition_block(
     block = None
     use_fused = False
     if config is not None:
+        if channels not in _PAIR_TRANSITION_CHANNELS + _SINGLE_TRANSITION_CHANNELS:
+            for lever in ("use_fused_transition_pair", "use_tiled_linear"):
+                if getattr(config, lever):
+                    kernel_census.inactive(f"{lever}[C={channels}]", f"gated to C in {_PAIR_TRANSITION_CHANNELS}")
         if config.use_fused_transition_pair and channels in _PAIR_TRANSITION_CHANNELS:
             use_fused = True
         elif config.use_fused_transition_single and channels in _SINGLE_TRANSITION_CHANNELS:

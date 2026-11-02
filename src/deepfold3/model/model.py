@@ -136,6 +136,7 @@ class DeepFold3(nn.Module):
         super().__init__()
         if cfg is None:
             cfg = ModelConfig()
+        cfg.optim.require_backends()
         self.cfg = cfg
 
         ec = cfg.evoformer

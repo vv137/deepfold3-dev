@@ -40,6 +40,8 @@ dev = [
     "ruff>=0.9.4",
 ]
 optim = ["triton>=3.0.0"]
+# NVIDIA proprietary license; stays optional. Serves --optim inference-cueq.
+cueq = ["cuequivariance-torch>=0.13.0", "cuequivariance-ops-torch-cu13>=0.13.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

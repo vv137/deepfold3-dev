@@ -59,6 +59,7 @@ from pathlib import Path
 import click
 import torch
 
+from deepfold3.model.config import OPTIM_PRESETS
 from deepfold3.model.guidance import (
     GuidanceSpec,
     build_guidance_terms,
@@ -202,9 +203,9 @@ def _save_logits(save, path: Path, *args, **kwargs) -> None:
 @click.option(
     "--optim",
     default="inference",
-    type=click.Choice(["none", "recommended", "inference", "all", "triton"]),
+    type=click.Choice(OPTIM_PRESETS),
     show_default=True,
-    help="Optimization preset: inference (default, Triton+tiling), recommended (training), triton (no tiling), none, all (testing)",
+    help="Kernel preset: inference (fastest), train-matched (the checkpoint's recorded kernels), none (stock PyTorch), inference-cueq (needs the cueq group)",
 )
 @click.option(
     "--matmul-precision",
@@ -522,18 +523,12 @@ def inference(
                 "with non-default architectural flags (e.g. residual_output_scaling), "
                 "the inference build will silently disagree."
             )
-    # ``--optim`` always overrides the OptimConfig sub-config so inference
-    # picks fused / SDPA / tiled kernels regardless of how the checkpoint
-    # was trained (training and inference often differ here).
-    if optim == "all":
-        model_cfg.optim = OptimConfig.all_enabled()
-    elif optim == "recommended":
-        model_cfg.optim = OptimConfig.recommended()
-    elif optim == "inference":
-        model_cfg.optim = OptimConfig.inference()
-    elif optim == "triton":
-        model_cfg.optim = OptimConfig.triton_only()
-    # else: keep checkpoint's optim (or default OptimConfig if no checkpoint cfg)
+    # ``--optim`` always decides the OptimConfig sub-config; ``train-matched``
+    # keeps the one the checkpoint recorded.
+    try:
+        model_cfg.optim = OptimConfig.from_preset(optim, ckpt_model_cfg.optim if ckpt_model_cfg is not None else None)
+    except ValueError as e:
+        raise click.UsageError(str(e)) from e
     model_cfg.diffusion.hoist_sampler = hoist_sampler
 
     if det and model_cfg.optim.use_torch_compile:
@@ -946,6 +941,7 @@ def inference(
             "status": "complete",
             "kernels": kernel_census.snapshot(),
             "kernels_shadowed": kernel_census.shadowed(),
+            "kernels_inactive": kernel_census.inactive(),
         },
     )
     click.echo(f"  saved  {manifest_path.resolve()}")

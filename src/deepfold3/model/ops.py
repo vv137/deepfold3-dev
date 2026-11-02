@@ -51,6 +51,7 @@ import torch.nn as nn
 
 from deepfold3.model import kernel_census
 from deepfold3.model.config import OptimConfig
+from deepfold3.model.inference_guard import NotActive
 from deepfold3.model.primitives import LayerNorm, LinearNoBias, pad_row_chunk
 
 
@@ -94,6 +95,15 @@ _TRIANGLE_MATMUL = {
     "bikc,bjkc->bijc": _triangle_matmul_outgoing,
     "bkjc,bkic->bijc": _triangle_matmul_incoming,
 }
+
+
+def _load_cueq_trimul():
+    """Import cuEquivariance's triangle multiply, which is an optional dependency."""
+    try:
+        from cuequivariance_torch import triangle_multiplicative_update
+    except ImportError as e:
+        raise NotActive("use_cueq_triangle_mul", f"install the cueq dependency group ({e})") from e
+    return triangle_multiplicative_update
 
 
 def set_router_stats_enabled(model: nn.Module, enabled: bool) -> None:
@@ -268,7 +278,18 @@ class _TriangleMulBase(nn.Module):
         self._fused_gate = None
         self._fused_dual_gemm = None
         self._fused_center_proj = None
-        if optim is not None and optim.use_fused_triangle_mul:
+        self._cueq_trimul = None
+        if optim is not None and optim.use_cueq_triangle_mul:
+            if self.is_mhr or self.use_router or c_z % 32:
+                # norm_center and routing sit inside the kernel, which takes C in multiples of 32.
+                kernel_census.inactive(f"use_cueq_triangle_mul[C={c_z}]", "needs plain heads and C divisible by 32")
+            else:
+                self._cueq_trimul = _load_cueq_trimul()
+                # The kernel chunks the projection into halves; ours interleaves.
+                # Its incoming contracts a[k,i] b[k,j], ours a[k,j] b[k,i], so a and b swap.
+                even, odd = torch.arange(0, 2 * c_z, 2), torch.arange(1, 2 * c_z, 2)
+                self._cueq_order = (torch.cat((even, odd)), torch.cat((odd, even)))[self._equation == "bkjc,bkic->bijc"]
+        if optim is not None and optim.use_fused_triangle_mul and self._cueq_trimul is None:
             # Level 3: Fused dual GEMM for proj+gate (cuEQ pattern — two GEMMs
             # share input tile loads, sigmoid+multiply fused in epilogue).
             # Falls back to Level 1 (FusedTriangleMulGate) if unavailable.
@@ -307,7 +328,26 @@ class _TriangleMulBase(nn.Module):
             # graph mishandles nested Triton kernel launches (SymNodeVariable error).
             self._compute = torch.compile(self._compute)
 
+    def _cueq_forward(self, z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        order = self._cueq_order.to(z.device)
+        return self._cueq_trimul(
+            z,
+            direction="outgoing" if self._equation == "bikc,bjkc->bijc" else "incoming",
+            mask=mask,
+            norm_in_weight=self.norm_left.weight,
+            norm_in_bias=self.norm_left.bias,
+            p_in_weight=self.proj.weight[order],
+            g_in_weight=self.gate.weight[order],
+            norm_out_weight=self.norm_center.weight,
+            norm_out_bias=self.norm_center.bias,
+            p_out_weight=self.out_proj.weight,
+            g_out_weight=self.out_gate.weight,
+        )
+
     def _compute(self, z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        if self._cueq_trimul is not None and z.is_cuda:
+            kernel_census.record("TriangleMul", "cueq")
+            return self._cueq_forward(z, mask)
         if self._fused_dual_gemm is not None and z.is_cuda:
             # Level 3: dual GEMM (cuEQ) — sigmoid + multiply fused in GEMM epilogue.
             z0 = self.norm_left(z)
