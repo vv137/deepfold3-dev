@@ -46,6 +46,7 @@ import click
 import torch
 
 from deepfold3.io.run_manifest import checkpoint_record, gpu_name, new_manifest, sha256_file, write_manifest
+from deepfold3.model import kernel_census
 from deepfold3.model.guidance import check_guidance_training, has_residue_ranges
 from deepfold3.model.restraints import RestraintSpec, build_restraints, describe_restraint
 from deepfold3.scripts import cli
@@ -302,6 +303,7 @@ def _run_one_job(
         **(manifest_fields or {}),
     )
     write_manifest(manifest_path, manifest)
+    kernel_census.reset_counts()
 
     summaries: list[dict] = []
 
@@ -383,6 +385,8 @@ def _run_one_job(
         summary_name = f"{job_name}_summary_confidences.json" if job_name else "summary_confidences.json"
         save_summary_confidences_json(output_dir / summary_name, summaries, job_name=job_name)
     manifest["status"] = "ok"
+    manifest["kernels"] = kernel_census.snapshot()
+    manifest["kernels_shadowed"] = kernel_census.shadowed()
     write_manifest(manifest_path, manifest)
 
 

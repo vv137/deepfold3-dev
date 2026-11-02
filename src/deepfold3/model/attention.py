@@ -38,6 +38,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from deepfold3.model import kernel_census
 from deepfold3.model.config import OptimConfig
 from deepfold3.model.primitives import LayerNorm, LinearNoBias, af3_linear_init_, map_row_chunks
 
@@ -93,6 +94,7 @@ class GridSelfAttention(nn.Module):
                 from deepfold3.model.triton.layernorm_transpose import FusedLayerNormTranspose
 
                 self._ln_transpose = FusedLayerNormTranspose(c, do_transpose=True)
+                kernel_census.requested("GridSelfAttention.norm", "fused_ln_transpose")
             except ImportError:
                 pass
         if self._evo_attn is None and optim is not None and optim.use_torch_compile:
@@ -184,17 +186,22 @@ class GridSelfAttention(nn.Module):
         _defer_transpose = self.transpose and self._evo_attn is not None and z.is_cuda
 
         if self._fused_pair_bias is not None and z.is_cuda:
+            kernel_census.record("GridSelfAttention.norm", "fused_pair_bias")
             pb = self._fused_pair_bias(z, self.norm.weight, self.norm.bias, self.pair_bias.weight)  # [B, H, N, N]
             z = self.norm(z)
             if self.transpose and not _defer_transpose:
                 z = z.permute(0, 2, 1, 3)
                 mask = mask.permute(0, 2, 1)
-        elif self._ln_transpose is not None and z.is_cuda:
+        elif self._ln_transpose is not None and z.is_cuda and not _defer_transpose:
+            # Not when deferring: that path reads z as untransposed, and this
+            # kernel exists only to save a transpose the deferred path never does.
+            kernel_census.record("GridSelfAttention.norm", "fused_ln_transpose")
             z_normed = self.norm(z)
             pb = self.pair_bias(z_normed).permute(0, 3, 1, 2)
             z = self._ln_transpose(z, self.norm.weight, self.norm.bias)
             mask = mask.permute(0, 2, 1)
         else:
+            kernel_census.record("GridSelfAttention.norm", "stock")
             z = self.norm(z)
             pb = self.pair_bias(z).permute(0, 3, 1, 2)
             if self.transpose and not _defer_transpose:
@@ -209,6 +216,7 @@ class GridSelfAttention(nn.Module):
         z_flat = z.reshape(B * N_rows, N_cols, C)
 
         if _defer_transpose:
+            kernel_census.record("GridSelfAttention.attention", "evo_attn_col")
             # Column attention fast path: pre-transpose QKV to kernel layout
             # [B, N2, H, N1, D] in one contiguous() call per tensor. The linear
             # output is freed immediately (no view chain keeps it alive), saving
@@ -231,6 +239,7 @@ class GridSelfAttention(nn.Module):
             g = torch.sigmoid(self.to_g(z_flat))
             out = self.out_proj(out * g)
         elif self._evo_attn is not None and z.is_cuda:
+            kernel_census.record("GridSelfAttention.attention", "evo_attn_row")
             # Row attention: pre-transpose QKV to kernel layout [B, N_rows, H, N_cols, D].
             # Each .contiguous() replaces the linear output immediately, so only the
             # transposed copy survives — avoids 3× duplicate N²C allocations.
@@ -246,6 +255,7 @@ class GridSelfAttention(nn.Module):
             g = torch.sigmoid(self.to_g(z_flat))
             out = self.out_proj(out * g)
         else:
+            kernel_census.record("GridSelfAttention.attention", "baseline")
             out = self._compute_baseline(z_flat, pb, mask, B, N_rows, N_cols)
 
         # Unfold back to [B, N_rows, N_cols, C_out]

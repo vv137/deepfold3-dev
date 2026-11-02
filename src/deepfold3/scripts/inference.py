@@ -937,7 +937,17 @@ def inference(
     except BaseException as e:
         write_manifest(manifest_path, {**manifest, "status": "failed", "error": repr(e)})
         raise
-    write_manifest(manifest_path, {**manifest, "status": "complete"})
+    from deepfold3.model import kernel_census
+
+    write_manifest(
+        manifest_path,
+        {
+            **manifest,
+            "status": "complete",
+            "kernels": kernel_census.snapshot(),
+            "kernels_shadowed": kernel_census.shadowed(),
+        },
+    )
     click.echo(f"  saved  {manifest_path.resolve()}")
 
 

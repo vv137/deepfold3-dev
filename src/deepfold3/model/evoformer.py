@@ -38,6 +38,7 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 
+from deepfold3.model import kernel_census
 from deepfold3.model.attention import GridSelfAttention, MSAAttention, SingleAttention
 from deepfold3.model.config import EvoformerConfig, OptimConfig, PairFormerConfig, TemplateEmbeddingConfig
 from deepfold3.model.ops import OuterProductMean, TriangleMulIncoming, TriangleMulOutgoing
@@ -157,6 +158,7 @@ class EvoformerBlock(nn.Module):
         # ``msa`` is the fresh sum above, so the in-place kernel cannot clobber a caller's tensor.
         # The kernel materialises no intermediate at all; row chunks bound the fallback's.
         fused_msa = msa_transition_residual_(self.msa_transition, msa, s) if self.use_fused_msa_transition else None
+        kernel_census.record("EvoformerBlock.msa_transition", "stock" if fused_msa is None else "fused")
         if fused_msa is not None:
             msa = fused_msa
         else:

@@ -49,6 +49,7 @@ import math
 import torch
 import torch.nn as nn
 
+from deepfold3.model import kernel_census
 from deepfold3.model.config import OptimConfig
 from deepfold3.model.primitives import LayerNorm, LinearNoBias, pad_row_chunk
 
@@ -635,14 +636,17 @@ class OuterProductMean(nn.Module):
 
         m = mask.unsqueeze(-1)  # [B, S, N, 1]
         if 0 < self._row_chunk < msa.shape[1] and not torch.is_grad_enabled():
+            kernel_census.record("OuterProductMean.project", "row_chunked")
             a, b = self._project_rows(msa, m)
         else:
+            kernel_census.record("OuterProductMean.project", "whole")
             msa = self.norm(msa)
             a = self.proj_a(msa) * m  # [B, S, N, c_hidden]
             b = self.proj_b(msa) * m  # [B, S, N, c_hidden]
 
         chunk = self._chunk_size
         N = a.shape[2]
+        kernel_census.record("OuterProductMean.contract", "tiled" if 0 < chunk < N else "whole")
         if chunk > 0 and chunk < N:
             from deepfold3.model.tiled_linear import tiled_opm_contract
 

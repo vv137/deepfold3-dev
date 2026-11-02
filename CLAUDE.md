@@ -169,6 +169,7 @@ src/deepfold3/
 │   ├── atom_cross_attn.py # AtomCrossAttEncoder/Decoder, EvoformerConditioningEncoder
 │   ├── diffusion.py      # DiffusionTransformer, DiffusionHead (sampling + training noise/denoise)
 │   ├── guidance.py       # `--guidance` terms: syntax, checkpoint check, chain names → GuidanceTerm
+│   ├── kernel_census.py  # Tally of the kernel path each dispatch site actually ran; written to run_manifest.json
 │   ├── confidence.py     # ConfidenceHead (pLDDT, PAE, PDE, exp_resolved)
 │   ├── bucket.py         # Bucket-based sequence length padding for training
 │   ├── model.py          # DeepFold3 (top-level, forward + forward_training), DeepFold3Output, DistogramHead

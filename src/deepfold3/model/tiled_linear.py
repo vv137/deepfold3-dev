@@ -29,6 +29,8 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 
+from deepfold3.model import kernel_census
+
 torch_checkpoint = _partial(_torch_checkpoint, use_reentrant=False, determinism_check="none")
 
 
@@ -142,9 +144,11 @@ class TiledLinear(_TransparentWrapper):
             return self.inner(x)
 
         if self.training and x.requires_grad:
+            kernel_census.record("TiledLinear", "tiled_grad")
             return _tiled_forward(x, self.inner, shards)
 
         if self._tile_inference or self.training:
+            kernel_census.record("TiledLinear", "tiled")
             chunks = x.chunk(shards, dim=-2)
             return torch.cat([self.inner(chunk) for chunk in chunks], dim=-2)
 
