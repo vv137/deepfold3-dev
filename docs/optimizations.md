@@ -379,8 +379,76 @@ the scores in fp32**: the `tl.dot` accumulator, the online-softmax running max
 `M`, and the `dQ`/`dK`/`dV`/`d_pair_bias` accumulators. Only the `tl.dot` operands
 themselves (`Q`, `K`, `V`, and the `P` / `dS` tiles fed back into a dot) are bf16.
 
-`softmax_scale` is applied **after** the QK dot, on the fp32 accumulator, in all
-four kernels. Folding it into Q (or K) before the dot re-rounds the operand to
+#### The backward never forms `dP - D`
+
+All three dS-forming kernels (`dq`, `db`, `dk_dv`) need
+`dS_j = P_j (dP_j - D)` with `D = Σ_i P_i dP_i`, and at the softmax argmax that
+difference is pure cancellation: `dP_imax` and `D` agree to `O(e^-m)` in the logit
+margin `m` (arXiv:2610.31642 §2, the `1 + e^-m` structure). In this kernel three
+separate roundings each destroy it on their own — measured at B1 S2 N256 H8 D32,
+margin 14.45, as the fraction of rows whose `dS_imax` is **exactly** zero:
+
+| mechanism | effect |
+| --- | --- |
+| (a) `D = rowsum(dO * O)` from the old `_attn_bwd_preprocess`: bf16 `P` operand before the PV dot | 77% of rows |
+| (a) same, via the bf16 `O` store | 87% of rows |
+| (b) `P = exp2((QK - M)/ln2)` rebuilt from the fp32 LSE: `P` is the true softmax times `1 ± ulp(|QK|)`, so at `|QK| ≈ 20` (ulp 2.4e-6 vs `e^-14.45` = 5.3e-7) `P_imax` rounds to exactly 1.0 and `Σ_j P_j` misses 1 by ~1e-6 | 40% of rows, *after* (a) is fixed |
+| (c) `D += tl.sum(P * dP, 1)` per KV tile: `O(e^-m)` tile partials land below the ulp of the winner's `O(1)` term | folded into (b)'s 40% |
+
+So the cliff was at the **bf16** ulp, `m ≈ 5.5`, despite every op after the load
+being fp32 — and recomputing `D` in fp32 does **not** lift it to the fp32
+reference's 16.6, because (b) is a property of the LSE representation, not of
+`D`'s arithmetic. An eager fp32 reference escapes (b) by normalising by a sum
+(`1 + e^-m` is representable) instead of subtracting a log-sum-exp; an LSE-based
+backward's own cliff is `log(1/ulp(|QK_max|))`, which depends on the logit
+magnitude (≈13 at `|QK| ≈ 20`).
+
+`_attn_bwd_d` therefore supplies the paper's eq. 5 form instead. It takes one
+extra KV pass over the scores and emits three per-row vectors — `dP` at the row's
+argmax, that column's index, and `C = Σ_i P_i (dP_i - dP_imax)` accumulated
+online with a re-centring step per tile — and the consumers form
+
+```
+u_j  = 0 at j = imax (by index), else dP_j - dP_imax
+dS_j = P_j (u_j - C)
+```
+
+which is algebraically identical (`Σ_i P_i = 1`) but never subtracts two `O(1)`
+quantities, and couples (b)'s normalisation drift only to `(D - dP_imax) =
+O(e^-m)`. `u` is zeroed by index rather than by arithmetic because the three
+consumers form `dP` with three different dots, and half an ulp of disagreement on
+`|dP| ≈ 0.5` is 3e-8 against a true `dS_imax` of ~1e-7. It is a separate kernel
+because `db` and `dk_dv` cannot build the triple themselves — their programs own
+an `(i, j)` tile and a KV block, so neither ever sees a whole row of `j`.
+
+Against an fp64 oracle at B1 S2 N256 H8 D32, margin 14.45 (the shape and spike of
+`test_extreme_attention_concentration`), before → after:
+
+| | before | after |
+| --- | --- | --- |
+| rows with `dS_imax` exactly 0 | 61.5% | **0.0%** |
+| median fraction of the true `dS_imax` kept | 0.000 | **1.0000** |
+| `d_pair_bias` row sum / peak element | 7.1 | **2.19e-3** (= the bf16 floor of the returned grad) |
+| `dQ` max error / true peak | 1.085 | **4.4e-3** |
+
+A margin sweep puts the old onset at `m ≈ 2.5` (row sums 10x the floor), half the
+signal gone by `m ≈ 6`, all of it by `m ≈ 8` — and past `m ≈ 16` the failure
+inverts: the stale `dS` stays at ~1e-8 while the truth keeps shrinking like
+`e^-m`, so `dQ` max error over true peak reaches 12 at `m = 18.5` and 622 at
+`m = 22.5`. Absolute magnitudes stay ≲1e-8 either way, but the regime injects
+noise rather than merely dropping signal. The fixed kernel holds every metric at
+the bf16 floor across `m = -1.5 … 22.5` with no cliff in range.
+
+**Cost.** One extra KV pass in the backward: fwd+bwd +7–8%, backward alone
++10–12% (medians of 60 iterations on an RTX 6000 Ada, at B1 S2 N384 H8 D32 and
+B1 S1 N768 H4 D32, interleaved against the base on one GPU). The forward is
+byte-for-byte unchanged, so inference pays nothing. Backward memory *falls*: `O`
+is no longer saved (it was the preprocess pass's only consumer — 64 B per
+`(batch, msa, head, res)` row at D=32) in exchange for three per-row vectors
+(12 B). See `tests/triton/test_evo_attn_softmax_collapse.py`.
+
+`softmax_scale` is applied **after** the QK dot, on the fp32 accumulator, in every
+kernel that recomputes scores. Folding it into Q (or K) before the dot re-rounds the operand to
 bf16, and that ~2^-9 relative perturbation becomes an absolute logit error
 proportional to the logit's magnitude — which the softmax exponentiates. At
 `|QK^T/sqrt(D)| ~ 1e2` (activations with stddev ≳ 3) it cost ~5% of forward

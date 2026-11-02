@@ -732,12 +732,17 @@ def test_extreme_attention_concentration():
     _assert_pass("extreme_attention_conc_fwd", params, m_fwd)
     # Backward: in the saturated regime dQ, dK and most of d_pair_bias shrink
     # to ~1e-7. That is NOT a noise floor — an fp64 oracle puts the true dQ at
-    # the same ~1.2e-7, so the 0.81 dQ fail_frac here is real signal loss
-    # (Softmax Collapse, arXiv:2610.31642 §2): the backward reads
-    # D = rowsum(dO * O) from the bf16-stored O, which rounds to V[winner]
-    # once the margin passes the bf16 cliff 5.5, zeroing dS at the winner
-    # slot. See tests/triton/test_evo_attn_softmax_collapse.py, which gates
-    # this against fp64 and is xfail until the kernel is fixed.
+    # the same ~1.2e-7, so the dQ fail_frac this test used to record (0.81) was
+    # real signal loss (Softmax Collapse, arXiv:2610.31642 §2): the backward
+    # read D = rowsum(dO * O) from the bf16-stored O, which rounds to V[winner]
+    # once the margin passes the bf16 cliff 5.5, zeroing dS at the winner slot.
+    # Fixed by `_attn_bwd_d`, which centres dP on the argmax (eq. 5 of the
+    # paper) instead of forming dP - D at all — recomputing D in fp32 is not
+    # enough, because the kernel's P comes from the saved LSE and at |QK| ~ 20
+    # its ulp (2.4e-6) is already coarser than e^-14.45 (5.3e-7).
+    # tests/triton/test_evo_attn_softmax_collapse.py gates it against fp64.
+    # The fail_frac against *this* file's fp32 eager reference stays non-zero,
+    # because that reference is itself degraded in the saturated regime.
     #
     # This gate stays absolute-error-vs-input-scale so the suite keeps
     # tracking gross breakage of the saturated path; it deliberately does not

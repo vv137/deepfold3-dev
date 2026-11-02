@@ -1,5 +1,10 @@
 """Softmax Collapse in the fused evo-attention backward (arXiv:2610.31642 §2).
 
+**Fixed**: ``_attn_bwd_d`` now supplies the paper's eq. 5 centring, so these two
+tests pass and stay in the suite as the regression gate. Recomputing ``D`` in
+fp32 — the obvious fix, and the one the tier list below used to call sufficient —
+was measured on GPU and is *not*: see tier 1 at the bottom.
+
 ``test_evo_attn_robustness.py::test_extreme_attention_concentration`` compares
 the fused kernel's winner-take-all backward against the fp32 eager reference
 and dismisses the 0.81 dQ fail_frac as "both kernel and ref at noise floor".
@@ -26,21 +31,35 @@ So fixing only the ``O`` store is **not** sufficient; the forward's
 ``P_block.to(V_block.dtype)`` poisons ``D`` on its own. Once the non-winner
 mass falls below bf16 ULP, ``D`` collapses onto ``dP_imax``, ``dS_imax`` is
 exactly 0 while the other ``K - 1`` entries stay non-zero, and the rows stop
-summing to zero. The kernel therefore collapses at the **bf16** cliff
+summing to zero. The kernel therefore collapsed at the **bf16** cliff
 ``c_16 ~= 5.5`` even though every arithmetic op after the load is fp32,
 whereas the eager fp32 reference survives to ``c_32 ~= 16.6``.
 
-Two tiers of fix, neither applied here:
-  1. Recompute ``D = sum_j P_j dP_j`` in the backward from the fp32 ``P`` it
-     already rebuilds, consistently with ``dP`` — one extra KV pass in
-     ``_attn_bwd_dq`` (or a D-recompute kernel). Lifts the cliff to 16.6.
-  2. Additionally centre ``dP`` on the argmax slot, the paper's eq. 5 move:
-     ``u_j = dP_j - dP_imax`` (exactly 0 at imax), ``dS_j = P_j (u_j -
-     sum_i P_i u_i)``. Exact to 2e-14 relative in fp32 and sums to zero at
-     any margin, but needs the argmax column saved from the forward.
+Two tiers of fix were characterised. Only the second one works here:
+  1. **Measured insufficient.** Recompute ``D = sum_j P_j dP_j`` in the
+     backward from the fp32 ``P`` it already rebuilds. That is what lifts an
+     *eager* reference to the fp32 cliff 16.6, but the kernel does not hold
+     ``P``: it rebuilds it as ``exp2((QK - M) / ln 2)`` from the fp32 LSE, so
+     its ``P`` is the true softmax scaled by ``1 +- ulp(|QK|)``. At this test's
+     spike height ``|QK| ~ 20`` that ulp is 2.4e-6 against ``e^-14.45 =
+     5.3e-7``: ``P_imax`` is *exactly* 1.0 and ``sum_j P_j`` misses 1 by ~1e-6,
+     both of which the uncentred ``dP_j - D`` multiplies by ``D = O(1)``.
+     Measured on GPU with ``D`` recomputed in fp32: 40.1% of rows still exactly
+     zero, median retention 0.000, row sums 18.4x their own peak element.
+  2. **Applied.** Centre ``dP`` on the argmax, the paper's eq. 5 move:
+     ``u_j = dP_j - dP_imax`` (forced to exactly 0 at imax by index),
+     ``dS_j = P_j (u_j - sum_i P_i u_i)``. Nothing is ever subtracted at O(1)
+     scale, and the LSE's normalisation drift now couples only to
+     ``(D - dP_imax) = O(e^-m)``. ``_attn_bwd_d`` emits the triple
+     ``(dP_imax, imax, C)`` per row in one KV pass — no forward change, no
+     argmax tensor from the forward — and the three consumers each spend one
+     ``tl.where``. 2e-14 is the paper's fp64 figure; in fp32, with
+     ``d_pair_bias`` returned cast to the grad dtype, the row-sum invariant
+     bottoms out at bf16 rounding (~2e-3 of the peak), which is what this file
+     checks.
 
 Run:
-    uv run pytest tests/triton/test_evo_attn_softmax_collapse.py -v
+    pytest tests/triton/test_evo_attn_softmax_collapse.py -v
 """
 
 from __future__ import annotations
@@ -139,15 +158,6 @@ def test_true_dq_is_small_but_not_noise():
     assert 3e-8 < peak < 1e-6, f"true dQ peak {peak:.3e} not the ~1.2e-7 the JSON records as ref"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Softmax Collapse: the backward takes D = rowsum(dO * O) from a bf16-rounded O, "
-        "so dS at the argmax is exactly 0 once the margin passes the bf16 cliff 5.5. "
-        "Fix requires recomputing D from the fp32 P, consistently with dP "
-        "(see module docstring)."
-    ),
-)
 def test_kernel_dq_matches_fp64_oracle_under_concentration():
     """dQ must track the fp64 oracle, not collapse to a fraction of it."""
     *inp, dO = _wta_inputs(20.0)
@@ -161,21 +171,18 @@ def test_kernel_dq_matches_fp64_oracle_under_concentration():
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Softmax Collapse: zeroing dS at the winner slot leaves the other K-1 entries "
-        "non-zero, so the rows no longer sum to zero. See module docstring."
-    ),
-)
 def test_rows_of_d_pair_bias_sum_to_zero():
     """The paper's invariant: softmax gradients must sum to zero over classes.
 
     ``d_pair_bias`` *is* the raw dS (summed over the MSA axis, which preserves
     the invariant), so this reads the invariant straight off a kernel output
-    with no index plumbing. The oracle sums to zero to machine precision; the
-    kernel does not, because one entry per row has been zeroed while the rest
-    stayed put.
+    with no index plumbing. The oracle sums to zero to machine precision. Before
+    the fix the kernel did not, because one entry per row — the winner's — had
+    been zeroed while the rest stayed put.
+
+    The kernel's floor is not zero but bf16: ``d_pair_bias`` is returned cast to
+    the grad dtype, so a satisfied invariant shows up as a row sum at bf16
+    rounding noise, two to three orders below the peak, not at 7x above it.
     """
     *inp, dO = _wta_inputs(20.0)
     _, ds_true, _, _ = _oracle(*inp, dO)
