@@ -669,6 +669,9 @@ class OptimConfig:
     to baseline if the backend is not installed.
 
     Benchmark results (RTX 5090, bf16, N=384-768):
+    Measured at C=128 with trunk triangle attention. Current configs use
+    pair_channel=256 and use_triangle_attention=false, so the module counts below
+    and GridSelfAttention's share of the runtime do not apply to them.
     ──────────────────────────────────────────────────────────────────
     ATTENTION (104 GridSelfAttention modules per forward):
     - use_fused_evo_attention: 2.9-3.3x faster (autotuned Triton flash-attn with pair bias)

@@ -335,7 +335,6 @@ src/deepfold3/model/triton/
 ├── layernorm_transpose.py    # FusedLayerNormTranspose (LN + dim transpose, elementwise)
 ├── triangle_mul_gate.py      # FusedTriangleMulGate (LN + packed GEMM + sigmoid, K-only)
 ├── swiglu.py                 # FusedSwiGLU (silu(a)*b convention, elementwise)
-├── tuning.py                 # Legacy hand-tuned block configs (kept for fallbacks)
 └── cache.py                  # Persistent autotuning cache (GPU-fingerprinted, on disk)
 ```
 
@@ -347,7 +346,7 @@ and reloaded on later runs (warm the cache once via `deepfold3 warmup-triton`; i
 | --------------------------------------------------------------------------------- | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | `_attn_fwd`, `_attn_bwd_dq`, `_attn_bwd_dk_dv` (evo_attention)                    | `[SEQ_LEN, DIM]`          | First-class autotune since the original commit                                                                                            |
 | `_fused_dual_gemm_fwd_kernel`, `_fused_dual_gemm_bwd_pregemm_kernel`              | `[M, N, K]`               | First-class autotune since the original commit                                                                                            |
-| `_second_forward_kernel`, `_first_backward_kernel` (layernorm_linear)             | `[M, N, K]` / `[M, K, N]` | Converted to persistent_autotune; previously used a hand-tuned `tuning.py` table that returned `None` (PyTorch fallback) for buckets ≤224 |
+| `_second_forward_kernel`, `_first_backward_kernel` (layernorm_linear)             | `[M, N, K]` / `[M, K, N]` | Converted to persistent_autotune; previously used a hand-tuned table, since removed, that returned `None` (PyTorch fallback) for buckets ≤224 |
 | `_ada_second_forward_kernel`, `_ada_first_backward_kernel` (ada_layernorm_linear) | `[M, N, K]` / `[M, K, N]` | Same conversion as above                                                                                                                  |
 
 The remaining elementwise kernels (`swiglu`, `triangle_mul_gate.{fwd,bwd}`,

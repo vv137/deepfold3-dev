@@ -142,15 +142,15 @@ Input features (tokens + atoms)
     → Evoformer trunk  [10 recycles]
         ├─ Template embedding (optional, T templates → pair)
         ├─ MSA processing (EvoformerBlock × 4)
-        └─ PairFormer stack (48 layers)
-               → single [N, 384]  +  pair [N, N, 128]
+        └─ PairFormer stack (48 layers, no triangle attention)
+               → single [N, 384]  +  pair [N, N, 256]
     → Diffusion Head  (200-step denoising)
         └─ atom_positions [S, N, M, 3]
     → Confidence Head (pLDDT, PAE, PDE, exp_resolved, pTM, ipTM)
     → Distogram Head
 ```
 
-**Key dimensions**: `seq_channel=384`, `pair_channel=128`, `msa_channel=64`, `num_recycles=10`, `diffusion_steps=200`, `num_samples=5`.
+**Key dimensions** (current configs; `config.py` defaults are 128 and 64): `seq_channel=384`, `pair_channel=256`, `msa_channel=128`, `num_recycles=10`, `diffusion_steps=200`, `num_samples=5`.
 
 **Atom representation**: Two layouts — _all-tokens_ (one representative atom per token) and _all-token-atoms_ `[N_tokens, max_atoms_per_token]` (all heavy atoms). Proteins/RNA/DNA use one token per residue; ligands use one token per atom.
 
@@ -185,7 +185,6 @@ src/deepfold3/
 │       ├── fused_ada_transition.py # Fused AdaTransition (diffusion FFN)
 │       ├── fused_transition.py    # Fused TransitionBlock
 │       ├── swiglu.py              # Fused SwiGLU
-│       ├── tuning.py              # Pre-tuned block size configs (CUDA/HIP)
 │       └── cache.py               # Persistent autotuning cache (GPU fingerprint)
 ├── data/            # Data pipeline
 │   ├── const.py          # RES_TYPE_ORDER, ELEMENT_TO_INT, REF_ATOMS, element_name_to_int(), get_res_type()
