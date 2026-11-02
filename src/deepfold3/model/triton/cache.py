@@ -392,7 +392,36 @@ def make_input_key(args: dict, key_args: list[str]) -> str:
     return "_".join(parts)
 
 
-def persistent_autotune(configs: list, key: list[str], kernel_name: str | None = None):
+def _reset_buffers_hook(names: list[str]):
+    """An autotune ``pre_hook`` that zeroes the output buffers a kernel accumulates into.
+
+    Autotuning benchmarks a kernel on the caller's real arguments, once per
+    config and several times each, and then runs it again. A kernel that
+    ``atomic_add``s into a buffer therefore returns the sum of all those runs,
+    so the first backward on an untuned shape was wrong by a factor of hundreds.
+
+    Triton's own ``reset_to_zero`` calls ``kwargs[name].zero_()``, which these
+    kernels cannot use: an unused output may be an int, and an unused pointer
+    may alias an input (``GRAD_MASK_ptr`` is ``x`` when there is no mask), which
+    would erase it. Those are skipped here.
+    """
+
+    def hook(kwargs: dict, reset_only: bool = False) -> None:
+        others = [v for k, v in kwargs.items() if k not in names]
+        for name in names:
+            buf = kwargs[name]
+            if hasattr(buf, "zero_") and not any(buf is o for o in others):
+                buf.zero_()
+
+    return hook
+
+
+def persistent_autotune(
+    configs: list,
+    key: list[str],
+    kernel_name: str | None = None,
+    reset_to_zero: list[str] | None = None,
+):
     """Decorator that wraps triton.autotune with persistent cache.
 
     On first call for a new (kernel, input_shape) combination:
@@ -408,6 +437,8 @@ def persistent_autotune(configs: list, key: list[str], kernel_name: str | None =
     Args:
         configs: List of triton.Config objects (same as triton.autotune).
         key: List of argument names to use as cache key.
+        reset_to_zero: Output arguments the kernel accumulates into. Required
+            for any kernel using ``atomic_add``; see :func:`_reset_buffers_hook`.
         kernel_name: Optional override for cache file name.
 
     Returns:
@@ -428,9 +459,11 @@ def persistent_autotune(configs: list, key: list[str], kernel_name: str | None =
 
         return _identity
 
+    tune_kwargs = {"pre_hook": _reset_buffers_hook(reset_to_zero)} if reset_to_zero else {}
+
     if _is_cache_disabled():
         # Just use standard triton.autotune
-        return triton.autotune(configs=configs, key=key)
+        return triton.autotune(configs=configs, key=key, **tune_kwargs)
 
     def decorator(fn):
         # Extract name from fn — handles JITFunction, Heuristics, or plain functions
@@ -452,7 +485,7 @@ def persistent_autotune(configs: list, key: list[str], kernel_name: str | None =
         mgr.load(fn_name)
 
         # Apply standard triton.autotune
-        autotuned_fn = triton.autotune(configs=configs, key=key)(fn)
+        autotuned_fn = triton.autotune(configs=configs, key=key, **tune_kwargs)(fn)
 
         # Wrap to (1) inject from our persistent cache into Triton's
         # internal Autotuner cache *before* the first call so the benchmark

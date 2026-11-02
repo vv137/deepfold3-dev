@@ -186,7 +186,7 @@ if HAS_TRITON:
             out_ptrs = OUT_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
             tl.store(out_ptrs, out, mask=out_mask)
 
-    @persistent_autotune(configs=_AUTOTUNE_CONFIGS, key=["M", "N", "K"])
+    @persistent_autotune(configs=_AUTOTUNE_CONFIGS, key=["M", "N", "K"], reset_to_zero=["GRAD_MASK_ptr"])
     @triton.jit
     def _fused_dual_gemm_bwd_pregemm_kernel(
         # ── Pointers ──

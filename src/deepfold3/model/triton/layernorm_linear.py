@@ -161,7 +161,9 @@ if HAS_TRITON:
     # Backward kernel reuses the same M-N-K config space. Cache key uses
     # the (M, K, N) ordering of this kernel's signature so the autotune cache
     # is keyed on the actual reduction dimension layout.
-    @persistent_autotune(configs=_GEMM_CONFIGS, key=["M", "K", "N"])
+    @persistent_autotune(
+        configs=_GEMM_CONFIGS, key=["M", "K", "N"], reset_to_zero=["dB", "dWEIGHT", "dBIAS", "c1", "c2"]
+    )
     @triton.jit
     def _first_backward_kernel(
         dOUT_ptr,

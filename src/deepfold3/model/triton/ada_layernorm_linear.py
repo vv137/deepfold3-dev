@@ -118,7 +118,7 @@ if HAS_TRITON:
         c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
         tl.store(c_ptrs, c, mask=c_mask)
 
-    @persistent_autotune(configs=_GEMM_CONFIGS, key=["M", "K", "N"])
+    @persistent_autotune(configs=_GEMM_CONFIGS, key=["M", "K", "N"], reset_to_zero=["dB", "c1", "c2"])
     @triton.jit
     def _ada_first_backward_kernel(
         dOUT_ptr,
