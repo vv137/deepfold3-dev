@@ -38,8 +38,8 @@ Our current optimization stack:
   Level 2: FusedLayerNormLinear for norm_center + out_proj (post-einsum)
   Level 3: FusedGatedDualGEMM — two GEMMs + sigmoid gate in one kernel (cuEQ pattern)
 
-Future: D-first layout for einsum (transpose_out=True → "dbik,dbjk->dbij"),
-fused LN+transpose on output, output gating via second dual GEMM.
+The D-first layout is ``use_channel_major_triangle_mul``: see ``_channel_major_forward``
+and ``triton/fused_trimul.py``.
 """
 
 from __future__ import annotations
@@ -60,7 +60,8 @@ def _triangle_matmul_outgoing(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
     Equivalent to ``torch.einsum('bikc,bjkc->bijc', a, b)`` but uses cuBLAS
     strided batch GEMM on non-contiguous views, avoiding the internal
-    ``.contiguous()`` copies that ``torch.einsum`` creates.
+    ``.contiguous()`` copies that ``torch.einsum`` creates. Contiguous
+    channel-first operands are about 3x faster than these views.
 
     Args:
         a: Tensor ``[B, N, N, C]`` (interpreted as ``[B, i, k, C]``).
@@ -279,17 +280,29 @@ class _TriangleMulBase(nn.Module):
         self._fused_dual_gemm = None
         self._fused_center_proj = None
         self._cueq_trimul = None
+        self._channel_major = False
+        self._fused_trimul = None
+        # The block kernels chunk the projection into halves; ours interleaves.
+        # Their incoming contracts a[k,i] b[k,j], ours a[k,j] b[k,i], so a and b swap.
+        even, odd = torch.arange(0, 2 * c_z, 2), torch.arange(1, 2 * c_z, 2)
+        self._block_order = (torch.cat((even, odd)), torch.cat((odd, even)))[self._equation == "bkjc,bkic->bijc"]
         if optim is not None and optim.use_cueq_triangle_mul:
             if self.is_mhr or self.use_router or c_z % 32:
                 # norm_center and routing sit inside the kernel, which takes C in multiples of 32.
                 kernel_census.inactive(f"use_cueq_triangle_mul[C={c_z}]", "needs plain heads and C divisible by 32")
             else:
                 self._cueq_trimul = _load_cueq_trimul()
-                # The kernel chunks the projection into halves; ours interleaves.
-                # Its incoming contracts a[k,i] b[k,j], ours a[k,j] b[k,i], so a and b swap.
-                even, odd = torch.arange(0, 2 * c_z, 2), torch.arange(1, 2 * c_z, 2)
-                self._cueq_order = (torch.cat((even, odd)), torch.cat((odd, even)))[self._equation == "bkjc,bkic->bijc"]
-        if optim is not None and optim.use_fused_triangle_mul and self._cueq_trimul is None:
+        if optim is not None and optim.use_channel_major_triangle_mul and self._cueq_trimul is None:
+            if self.is_mhr or self.use_router:
+                # Per-head norm and routing read the contraction in channel-last form.
+                kernel_census.inactive(f"use_channel_major_triangle_mul[C={c_z}]", "needs plain heads")
+            else:
+                from deepfold3.model.triton import fused_trimul
+
+                self._channel_major = True
+                if fused_trimul.HAS_TRITON and c_z in fused_trimul.SUPPORTED_C:
+                    self._fused_trimul = fused_trimul
+        if optim is not None and optim.use_fused_triangle_mul and self._cueq_trimul is None and not self._channel_major:
             # Level 3: Fused dual GEMM for proj+gate (cuEQ pattern — two GEMMs
             # share input tile loads, sigmoid+multiply fused in epilogue).
             # Falls back to Level 1 (FusedTriangleMulGate) if unavailable.
@@ -321,7 +334,10 @@ class _TriangleMulBase(nn.Module):
                     pass
 
         _has_triton_fused = (
-            self._fused_gate is not None or self._fused_dual_gemm is not None or self._fused_center_proj is not None
+            self._fused_gate is not None
+            or self._fused_dual_gemm is not None
+            or self._fused_center_proj is not None
+            or self._fused_trimul is not None
         )
         if optim is not None and optim.use_torch_compile and not _has_triton_fused:
             # Don't combine torch.compile with fused Triton kernels — the compiled
@@ -329,7 +345,7 @@ class _TriangleMulBase(nn.Module):
             self._compute = torch.compile(self._compute)
 
     def _cueq_forward(self, z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        order = self._cueq_order.to(z.device)
+        order = self._block_order.to(z.device)
         return self._cueq_trimul(
             z,
             direction="outgoing" if self._equation == "bikc,bjkc->bijc" else "incoming",
@@ -344,10 +360,61 @@ class _TriangleMulBase(nn.Module):
             g_out_weight=self.out_gate.weight,
         )
 
+    def _channel_major_forward(self, z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Differentiable triangle multiply on contiguous channel-first planes.
+
+        The GEMMs write channel-major output directly (``W @ x^T``), so no permute
+        sits between the projection and the contraction. This is the path of calls
+        the kernels cannot serve: CPU, C = 64, fp32 GEMMs, or few tokens. Bf16 calls
+        take the three-launch kernels of the same layout, with a fused backward in
+        training.
+        """
+        B, N, _, C = z.shape
+        outgoing = self._equation == "bikc,bjkc->bijc"
+        order = self._block_order.to(z.device)
+        if self._fused_trimul is not None and self._serves_fused_trimul(z):
+            w_gate, w_proj = self.gate.weight[order], self.proj.weight[order]
+            if not torch.is_grad_enabled():
+                kernel_census.record("TriangleMul", "fused_trimul")
+                return self._fused_trimul.fused_trimul(
+                    z, mask, outgoing, self.norm_left, w_gate, w_proj,
+                    self.norm_center, self.out_proj.weight, self.out_gate.weight,
+                )  # fmt: skip
+            kernel_census.record("TriangleMul", "fused_trimul_grad")
+            return self._fused_trimul.FusedTriMulFunction.apply(
+                self.norm_left(z).contiguous(), mask, w_gate, w_proj, self.norm_center.weight, self.norm_center.bias,
+                self.out_proj.weight, self.out_gate.weight, self.norm_center.eps, outgoing,
+            )  # fmt: skip
+        kernel_census.record("TriangleMul", "channel_major")
+        x = self.norm_left(z).reshape(-1, C).T  # [C, B N^2]
+        ab = torch.sigmoid(self.gate.weight[order] @ x) * (self.proj.weight[order] @ x)
+        ab = (ab * mask.reshape(-1).to(ab.dtype)).reshape(2, C, B, N, N)
+        act = ab[0] @ ab[1].mT if outgoing else ab[0].mT @ ab[1]
+        del ab
+        norm = self.norm_center
+        act32 = act.float()
+        centered = act32 - act32.mean(0, keepdim=True)
+        rstd = (centered.pow(2).mean(0, keepdim=True) + norm.eps).sqrt().reciprocal()
+        act = (centered * rstd * norm.weight[:, None, None, None] + norm.bias[:, None, None, None]).to(act.dtype)
+        update = torch.sigmoid(self.out_gate.weight @ x) * (self.out_proj.weight @ act.reshape(C, -1))
+        return update.reshape(C, B, N, N).permute(1, 2, 3, 0).contiguous()
+
+    @staticmethod
+    def _serves_fused_trimul(z: torch.Tensor) -> bool:
+        """Whether a call fits the kernels: CUDA, bf16 GEMMs, enough tokens."""
+        from deepfold3.model.triton.fused_trimul import MIN_TOKENS
+
+        if not z.is_cuda or z.shape[1] < MIN_TOKENS:
+            return False
+        autocast_bf16 = torch.is_autocast_enabled("cuda") and torch.get_autocast_dtype("cuda") == torch.bfloat16
+        return z.dtype == torch.bfloat16 or (z.dtype == torch.float32 and autocast_bf16)
+
     def _compute(self, z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         if self._cueq_trimul is not None and z.is_cuda:
             kernel_census.record("TriangleMul", "cueq")
             return self._cueq_forward(z, mask)
+        if self._channel_major:
+            return self._channel_major_forward(z, mask)
         if self._fused_dual_gemm is not None and z.is_cuda:
             # Level 3: dual GEMM (cuEQ) — sigmoid + multiply fused in GEMM epilogue.
             z0 = self.norm_left(z)

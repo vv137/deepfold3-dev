@@ -716,6 +716,10 @@ class OptimConfig:
     # cuEquivariance triangle multiply (optional ``cueq`` group). Takes precedence
     # over use_fused_triangle_mul; refuses at construction if not installed.
     use_cueq_triangle_mul: bool = False
+    # Triangle multiply on channel-first planes with a fused backward; see
+    # model/triton/fused_trimul.py. Calls the kernels cannot serve run the same layout
+    # in plain torch. Takes precedence over use_fused_triangle_mul.
+    use_channel_major_triangle_mul: bool = False
     use_fused_ln_transpose: bool = False
     # Evoformer MSA transition as one in-place forward-only kernel (no [..., 2*hidden]
     # tensor; see model/triton/msa_transition.py). Served only with grad disabled, so
@@ -782,7 +786,7 @@ class OptimConfig:
             use_fused_evo_attention=True,
             use_fused_pair_bias=True,
             use_fused_swiglu=True,
-            use_fused_triangle_mul=True,
+            use_channel_major_triangle_mul=True,
             use_fused_transition_pair=True,
             use_fused_msa_transition_inference=True,
             tiled_opm_chunk=128,
@@ -796,7 +800,7 @@ class OptimConfig:
         Needs the optional ``cueq`` dependency group; construction refuses without it.
         """
         cfg = cls.inference()
-        cfg.use_fused_triangle_mul = False
+        cfg.use_channel_major_triangle_mul = False
         cfg.use_cueq_triangle_mul = True
         return cfg
 
