@@ -21,7 +21,8 @@ design, so activation checkpointing drops and rebuilds them with ``save_for_back
 
 Ported from ``fpf_trimul_v4`` in anthropics/uplifting-biomolecular-modeling; see
 ``fused_trimul.NOTICE``. Modified: pointer kernels only, without the batch-limit,
-bias, residual and descriptor paths. The two VJP kernels are ours.
+bias, residual and descriptor paths, and with our autotune in place of its cell
+table. The two VJP kernels are ours.
 """
 
 from __future__ import annotations
@@ -42,25 +43,27 @@ SUPPORTED_C = (128, 256)
 MIN_TOKENS = 101  # Below this the launches cost more than the torch formula.
 _PAD = 16
 
-# Fixed tiles keyed by compute capability, so results do not depend on an autotune
-# run. (9, 0) and (10, x) are the upstream certified pointer cells, (8, 9) is ours.
-_SAFE_CELL = {"k1": dict(BM=64, BN=32, num_warps=4, num_stages=1), "k3": dict(BM=64, BN=64, num_warps=4, num_stages=1)}
-_CELLS = {
-    (8, 9): {"k1": dict(BM=128, BN=64, num_warps=8, num_stages=1), "k3": dict(BM=64, BN=64, num_warps=4, num_stages=1)},
-    (9, 0): {
-        "k1": dict(BM=128, BN=128, num_warps=8, num_stages=1),
-        "k1_128": dict(BM=64, BN=32, num_warps=4, num_stages=2),
-        "k3": dict(BM=64, BN=64, num_warps=4, num_stages=1),
-    },
-    (10, 0): {"k1": dict(BM=128, BN=64, num_warps=4, num_stages=1), "k3": dict(BM=64, BN=64, num_warps=8, num_stages=1)},
-    (10, 3): {"k1": dict(BM=128, BN=64, num_warps=4, num_stages=1), "k3": dict(BM=64, BN=64, num_warps=8, num_stages=1)},
-}
-# The VJP kernels hold more tiles than the forward ones, so they take their own cell.
-# Swept on RTX 6000 Ada; not yet swept on other architectures.
-_VJP_CELL = {"k1": dict(BM=32, BN=64, num_warps=8, num_stages=2), "k3": dict(BM=32, BN=32, num_warps=8, num_stages=1)}
-
 if HAS_TRITON:
+    from deepfold3.model.triton.cache import persistent_autotune
 
+    def _configs(bm, bn, warps, stages):
+        return [
+            triton.Config({"BM": m, "BN": n}, num_warps=w, num_stages=s)
+            for m in bm
+            for n in bn
+            for w in warps
+            for s in stages
+        ]
+
+    # The first config of each list is what ``--det`` serves, so it must build on
+    # every architecture: SAFE cells upstream, or the smallest tiles for the VJPs.
+    # Tiles change only the order of floating-point sums, and BN must divide C.
+    _PROJECT_CONFIGS = _configs((64, 128), (32, 64, 128), (4, 8), (1, 2))
+    _OUTPUT_CONFIGS = _configs((64, 32), (64, 32), (4, 8), (1,))
+    _PROJECT_VJP_CONFIGS = _configs((32, 16), (32, 64), (4, 8), (1, 2))
+    _OUTPUT_VJP_CONFIGS = _configs((32, 16), (32, 16), (4, 8), (1,))
+
+    @persistent_autotune(configs=_PROJECT_CONFIGS, key=["N", "C"], kernel_name="fused_trimul_project")
     @triton.jit
     def _project_kernel(
         z_ptr, lnw_ptr, lnb_ptr, wgT_ptr, wpT_ptr, mask_ptr, ab_ptr,
@@ -102,6 +105,7 @@ if HAS_TRITON:
             plane = nch.to(tl.int64) + bidx * C + (nch >= C).to(tl.int64) * (B - 1) * C
             tl.store(ab_ptr + obase[:, None] + (plane * plane_stride)[None, :], val.to(tl.bfloat16), mask=smask[:, None])
 
+    @persistent_autotune(configs=_OUTPUT_CONFIGS, key=["N", "C"], kernel_name="fused_trimul_output")
     @triton.jit
     def _output_kernel(
         x_ptr, z_ptr, lnow_ptr, lnob_ptr, lniw_ptr, lnib_ptr, wz_ptr, wg_ptr, out_ptr,
@@ -146,6 +150,12 @@ if HAS_TRITON:
             else:
                 tl.store(optrs, o.to(tl.bfloat16), mask=rmask[None, :])
 
+    @persistent_autotune(
+        configs=_OUTPUT_VJP_CONFIGS,
+        key=["N", "C"],
+        kernel_name="fused_trimul_output_vjp",
+        reset_to_zero=["glnw_ptr", "glnb_ptr"],
+    )
     @triton.jit
     def _output_vjp_kernel(
         g_ptr, plane_ptr, x_ptr, lnow_ptr, lnob_ptr, wz_ptr, wg_ptr,
@@ -204,15 +214,17 @@ if HAS_TRITON:
         tl.atomic_add(glnw_ptr + ch, tl.sum(acc_o * xn, axis=1))
         tl.atomic_add(glnb_ptr + ch, tl.sum(acc_o, axis=1))
 
+    @persistent_autotune(configs=_PROJECT_VJP_CONFIGS, key=["N", "C"], kernel_name="fused_trimul_project_vjp")
     @triton.jit
     def _project_vjp_kernel(
-        gab_ptr, x_ptr, wgT_ptr, wpT_ptr, mask_ptr, gp_ptr, gg_ptr, gx_ptr,
+        gab_ptr, x_ptr, wgT_ptr, wpT_ptr, mask_ptr, gp_ptr, gg_ptr, gx_ptr, gx_out_ptr,
         N, Np, plane_stride, NN, M, B,
         C: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
     ):  # fmt: skip
         """Cotangent of the gated projections for one (token tile, row, batch element).
 
-        Adds ``Wp^T gp + Wg^T gg`` to the output stage's x cotangent in place.
+        Adds ``Wp^T gp + Wg^T gg`` to the output stage's x cotangent. The sum goes to a
+        separate buffer: autotuning reruns the kernel on the same arguments.
         """
         pid_j = tl.program_id(0)
         i = tl.program_id(1).to(tl.int64)
@@ -246,31 +258,23 @@ if HAS_TRITON:
             acc = acc + tl.dot(gp, tl.trans(wp)) + tl.dot(gg, tl.trans(wg))
             tl.store(gp_ptr + tok[:, None] + (nch64 * M)[None, :], gp, mask=lmask[:, None])
             tl.store(gg_ptr + tok[:, None] + (nch64 * M)[None, :], gg, mask=lmask[:, None])
-        tl.store(gx_ptr + toff, acc, mask=lmask[:, None])
-
-
-def _cell(device: torch.device, c: int) -> tuple[dict, dict]:
-    cell = _CELLS.get(torch.cuda.get_device_capability(device), _SAFE_CELL)
-    return cell.get(f"k1_{c}", cell["k1"]), cell["k3"]
+        tl.store(gx_out_ptr + toff, acc, mask=lmask[:, None])
 
 
 def _forward(z, m, outgoing, lniw, lnib, wgT, wpT, lnow, lnob, wz, wg, eps_in, eps_out, norm):
     """Launch K1, the contraction and K3. Returns the planes, the contraction and the update."""
     B, N, _, C = z.shape
     Np = triton.cdiv(N, _PAD) * _PAD
-    k1, k3 = _cell(z.device, C)
     ab = torch.empty((2, B, C, Np, Np), dtype=torch.bfloat16, device=z.device)
-    _project_kernel[(triton.cdiv(Np, k1["BM"]), Np, B)](
-        z, lniw, lnib, wgT, wpT, m, ab, N, Np, Np * Np, eps_in, N * N, B,
-        C=C, BM=k1["BM"], BN=k1["BN"], NORM=norm, num_warps=k1["num_warps"], num_stages=k1["num_stages"],
+    _project_kernel[lambda meta: (triton.cdiv(Np, meta["BM"]), Np, B)](
+        z, lniw, lnib, wgT, wpT, m, ab, N, Np, Np * Np, eps_in, N * N, B, C=C, NORM=norm,
     )  # fmt: skip
     a, b = ab[0].view(B * C, Np, Np), ab[1].view(B * C, Np, Np)
     act = torch.bmm(a, b.transpose(1, 2)) if outgoing else torch.bmm(a.transpose(1, 2), b)
     out = torch.empty_like(z)
-    _output_kernel[(triton.cdiv(N, k3["BM"]), N, B)](
+    _output_kernel[lambda meta: (triton.cdiv(N, meta["BM"]), N, B)](
         act, z, lnow, lnob, lniw, lnib, wz, wg, out, N, Np, Np * Np, eps_out, N * N,
-        C=C, BM=k3["BM"], BN=k3["BN"], IN_F32=z.dtype == torch.float32, NORM=norm,
-        num_warps=k3["num_warps"], num_stages=k3["num_stages"],
+        C=C, IN_F32=z.dtype == torch.float32, NORM=norm,
     )  # fmt: skip
     return ab, act, out
 
@@ -295,17 +299,15 @@ class FusedTriMulFunction(torch.autograd.Function):
         x, m, ab, act, wgT, wpT, wz, wg, lnow, lnob = ctx.saved_tensors
         B, N, _, C = x.shape
         Np, M = act.shape[-1], B * N * N
-        k1, k3 = _VJP_CELL["k1"], _VJP_CELL["k3"]
         g = g.float().contiguous()
         bf = dict(dtype=torch.bfloat16, device=x.device)
         gp_o, gg_o, xln = torch.empty((C, M), **bf), torch.empty((C, M), **bf), torch.empty((C, M), **bf)
         gact = torch.zeros((B, C, Np, Np), **bf)
         gx = torch.empty_like(g)
         glnw, glnb = torch.zeros_like(lnow), torch.zeros_like(lnob)
-        _output_vjp_kernel[(triton.cdiv(N, k3["BM"]), N, B)](
+        _output_vjp_kernel[lambda meta: (triton.cdiv(N, meta["BM"]), N, B)](
             g, act, x, lnow, lnob, wz, wg, gp_o, gg_o, xln, gact, gx, glnw, glnb,
-            N, Np, Np * Np, ctx.eps, N * N, M,
-            C=C, BM=k3["BM"], BN=k3["BN"], num_warps=k3["num_warps"], num_stages=k3["num_stages"],
+            N, Np, Np * Np, ctx.eps, N * N, M, C=C,
         )  # fmt: skip
         xb = x.reshape(M, C).to(torch.bfloat16)
         g_out, g_out_gate = (gp_o @ xln.T).float(), (gg_o @ xb).float()
@@ -318,12 +320,12 @@ class FusedTriMulFunction(torch.autograd.Function):
             gab = torch.stack((torch.bmm(b, ga.transpose(1, 2)), torch.bmm(a, ga)))
         del gact, ga, a, b
         gp_i, gg_i = torch.empty((2 * C, M), **bf), torch.empty((2 * C, M), **bf)
-        _project_vjp_kernel[(triton.cdiv(N, k1["BM"]), N, B)](
-            gab, x, wgT, wpT, m, gp_i, gg_i, gx, N, Np, Np * Np, N * N, M, B,
-            C=C, BM=k1["BM"], BN=k1["BN"], num_warps=k1["num_warps"], num_stages=k1["num_stages"],
+        gx_out = torch.empty_like(gx)
+        _project_vjp_kernel[lambda meta: (triton.cdiv(N, meta["BM"]), N, B)](
+            gab, x, wgT, wpT, m, gp_i, gg_i, gx, gx_out, N, Np, Np * Np, N * N, M, B, C=C,
         )  # fmt: skip
-        del gab
-        return gx.to(x.dtype), None, (gg_i @ xb).float(), (gp_i @ xb).float(), glnw, glnb, g_out, g_out_gate, None, None
+        del gab, gx
+        return gx_out.to(x.dtype), None, (gg_i @ xb).float(), (gp_i @ xb).float(), glnw, glnb, g_out, g_out_gate, None, None
 
 
 @inference_only("fused_trimul")

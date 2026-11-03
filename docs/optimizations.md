@@ -246,12 +246,12 @@ Real activations from `checkpoint_120000` under bf16 autocast, 42 captures, RTX 
 
 | Kernel | fwd | fwd+bwd | Peak fwd+bwd | Output error | `z` gradient error |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Stock | 24.8 ms | 78.6 ms | 6.61 GiB | 1.000 | 7.52e-3 |
-| Level 3 dual GEMM | 18.6 ms | 62.7 ms | 5.23 GiB | 1.173 | 7.69e-3 |
+| Stock | 24.8 ms | 79.2 ms | 6.61 GiB | 1.000 | 7.52e-3 |
+| Level 3 dual GEMM | 18.6 ms | 63.4 ms | 5.23 GiB | 1.173 | 7.69e-3 |
 | cuEquivariance | 13.8 ms | 45.6 ms | 5.23 GiB | 0.824 | 5.35e-3 |
-| **Channel-major** | **3.9 ms** | **31.2 ms** | 6.21 GiB | 0.824 | **4.52e-3** |
+| **Channel-major** | **4.0 ms** | **30.5 ms** | 6.60 GiB | 0.824 | **4.52e-3** |
 
-GEMMs are not the cost: one takes 0.8 ms at this shape, while the output LayerNorm and its autograd backward take 36 ms. Calls the kernels cannot serve (CPU, C=64, fp32 GEMMs, N < 101) run the same layout in plain torch and are no faster than stock in fwd+bwd. Training presets leave the flag off. VJP tiles are swept on Ada only; the forward cells for `sm_90` and `sm_100` are upstream's and unmeasured here.
+GEMMs are not the cost: one takes 0.8 ms at this shape, while the output LayerNorm and its autograd backward take 36 ms. Calls the kernels cannot serve (CPU, C=64, fp32 GEMMs, N < 101) run the same layout in plain torch and are no faster than stock in fwd+bwd. Training presets leave the flag off. Tiles come from `persistent_autotune` like the other fused kernels, so run `deepfold3 warmup-triton` before enabling the flag in DDP training; `--det` serves the first config of each list.
 
 A requested kernel that cannot run is never a silent stock run:
 

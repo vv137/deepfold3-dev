@@ -1,7 +1,7 @@
 fused_trimul.py derives from common/opt_core/opt_core/kernels/fpf_trimul_v4/kernels.py in
 https://github.com/anthropics/uplifting-biomolecular-modeling (commit f4f62fa), Apache License 2.0.
 Modified for DeepFold3: pointer kernels only; batch-limit, bias, residual and descriptor paths removed;
-launch cells reduced to a table keyed by compute capability; bf16 rounding kept as upstream.
+the launch-cell table replaced by persistent_autotune; bf16 rounding kept as upstream.
 
 Upstream NOTICE: portions re-state the arithmetic of Protenix's pair-stack modules
 (protenix/model/triangular/*, protenix/model/modules/pairformer.py, protenix/model/layer_norm):

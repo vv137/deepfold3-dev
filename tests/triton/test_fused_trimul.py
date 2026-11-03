@@ -15,6 +15,7 @@ from deepfold3.model.config import OptimConfig
 from deepfold3.model.inference_guard import InferenceOnlyKernelError
 from deepfold3.model.ops import TriangleMulIncoming, TriangleMulOutgoing
 
+pytestmark = pytest.mark.timeout(600)  # A cold cache compiles and autotunes four kernels per shape.
 CHANNEL_MAJOR = OptimConfig(use_channel_major_triangle_mul=True)
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -102,6 +103,22 @@ def test_fused_backward_matches_stock():
             for k, ref in grads[0].items():
                 errors = [(g[k] - ref).norm() / ref.norm().clamp_min(1e-30) for g in grads[1:]]
                 assert errors[1] < 3 * errors[0] + 1e-3, k
+
+
+@cuda
+def test_autotuned_first_backward_equals_the_next():
+    """Autotuning reruns the kernels, which must not accumulate into their outputs."""
+    _, new = build(TriangleMulOutgoing, 128, "cuda")
+    z, mask = pair(149, 128, "cuda")
+    grads = []
+    for _ in range(2):
+        new.zero_grad(set_to_none=True)
+        x = z.clone().requires_grad_()
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            new(x, mask).float().pow(2).sum().backward()
+        grads.append({"z": x.grad.clone(), **{k: p.grad.clone() for k, p in new.named_parameters()}})
+    for k, g in grads[0].items():
+        torch.testing.assert_close(g, grads[1][k], rtol=1e-2, atol=1e-2, msg=k)
 
 
 @cuda
