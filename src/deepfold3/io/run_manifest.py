@@ -9,6 +9,7 @@ process is killed.
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import os
 import platform
@@ -51,11 +52,16 @@ def runtime_versions() -> dict:
         triton_version = triton.__version__
     except ImportError:
         triton_version = None
+    try:
+        cueq_version = importlib.metadata.version("cuequivariance-ops-torch-cu13")
+    except importlib.metadata.PackageNotFoundError:
+        cueq_version = None
     driver = _run("nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader")
     return {
         "python": platform.python_version(),
         "torch": torch.__version__,
         "triton": triton_version,
+        "cuequivariance_ops": cueq_version,
         "cuda": torch.version.cuda,
         "cuda_driver": driver.splitlines()[0] if driver else None,
     }

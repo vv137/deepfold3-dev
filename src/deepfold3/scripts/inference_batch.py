@@ -47,6 +47,7 @@ import torch
 
 from deepfold3.io.run_manifest import checkpoint_record, gpu_name, new_manifest, sha256_file, write_manifest
 from deepfold3.model import kernel_census
+from deepfold3.model.config import OPTIM_PRESETS
 from deepfold3.model.guidance import check_guidance_training, has_residue_ranges
 from deepfold3.model.restraints import RestraintSpec, build_restraints, describe_restraint
 from deepfold3.scripts import cli
@@ -108,14 +109,10 @@ def _load_model_once(
     if ckpt_model_cfg is None and params.suffix == ".pt":
         click.echo("[batch] checkpoint has no embedded model_cfg — using ModelConfig() defaults")
 
-    if optim == "all":
-        model_cfg.optim = OptimConfig.all_enabled()
-    elif optim == "recommended":
-        model_cfg.optim = OptimConfig.recommended()
-    elif optim == "inference":
-        model_cfg.optim = OptimConfig.inference()
-    elif optim == "triton":
-        model_cfg.optim = OptimConfig.triton_only()
+    try:
+        model_cfg.optim = OptimConfig.from_preset(optim, ckpt_model_cfg.optim if ckpt_model_cfg is not None else None)
+    except ValueError as e:
+        raise click.UsageError(str(e)) from e
 
     # See ``inference``: default follows the MSA pool cap, not the training crop.
     from deepfold3.data.const import MAX_MSA_ROWS
@@ -387,6 +384,7 @@ def _run_one_job(
     manifest["status"] = "ok"
     manifest["kernels"] = kernel_census.snapshot()
     manifest["kernels_shadowed"] = kernel_census.shadowed()
+    manifest["kernels_inactive"] = kernel_census.inactive()
     write_manifest(manifest_path, manifest)
 
 
@@ -500,7 +498,7 @@ def _parse_inputs_file(path: Path, output_template: str, params: Path) -> list[t
 @click.option(
     "--optim",
     default="inference",
-    type=click.Choice(["none", "recommended", "inference", "all", "triton"]),
+    type=click.Choice(OPTIM_PRESETS),
     show_default=True,
 )
 @click.option(
@@ -726,8 +724,6 @@ def inference_batch(
 
     if det:
         apply_det_recipe()
-        if optim in ("recommended", "all"):
-            raise click.UsageError(f"--det cannot fix torch.compile's kernels; --optim {optim} enables it")
 
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 

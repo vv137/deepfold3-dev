@@ -745,7 +745,7 @@ The checkpoint pipeline embeds the architectural `ModelConfig` on both sides of 
 - **`.pt` training checkpoints**: `CheckpointManager.save` already pickles `model_cfg`. `deepfold3 inference --params <ckpt>.pt` deep-copies it out of the blob and uses it as the base.
 - **`.safetensors` files**: `convert_weights.py` and any future writer embed a JSON-serialised `ModelConfig` under the `model_cfg_json` metadata key (`SAFETENSORS_MODEL_CFG_KEY`). `deepfold3 inference --params <weights>.safetensors` reads the metadata via `safe_open(...).metadata()` (header-only, cheap) and reconstructs the dataclass via `model_cfg_from_metadata`. Forward-compatible: unknown future fields are silently dropped.
 
-The `--optim` flag always overrides only `OptimConfig`, never the architectural fields. Legacy `.safetensors` (no metadata) and raw AF3 `.bin` / `.bin.zst` paths fall back to `ModelConfig()` defaults with a one-line warning.
+The `--optim` flag decides only `OptimConfig`, never the architectural fields; `train-matched` keeps the `OptimConfig` the checkpoint recorded. Legacy `.safetensors` (no metadata) and raw AF3 `.bin` / `.bin.zst` paths fall back to `ModelConfig()` defaults with a one-line warning.
 
 ## Training Stages
 

@@ -27,13 +27,17 @@ that reaches the tens of thousands changes nothing.
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections import defaultdict
 
-__all__ = ["record", "requested", "shadowed", "snapshot", "reset_counts", "reset", "format_census"]
+__all__ = ["inactive", "record", "requested", "shadowed", "snapshot", "reset_counts", "reset", "format_census"]
+
+logger = logging.getLogger(__name__)
 
 _counts: defaultdict[str, defaultdict[str, int]] = defaultdict(lambda: defaultdict(int))
 _requested: dict[str, str] = {}
+_inactive: dict[str, str] = {}
 _warned: set[str] = set()
 _warn_lock = threading.Lock()
 
@@ -55,6 +59,22 @@ def requested(site: str, lever: str) -> None:
     :func:`snapshot` is shadowed, and :func:`shadowed` reports it.
     """
     _requested[f"{site}:{lever}"] = site
+
+
+def inactive(lever: str | None = None, reason: str = "") -> dict[str, str]:
+    """Note a lever gated off at construction, and return all such levers.
+
+    A gated lever has no dispatch site, so :func:`shadowed` cannot see it.
+    Noted once per model build, and kept by :func:`reset_counts`.
+
+    Args:
+        lever: Name of the lever, or ``None`` to only read.
+        reason: Why it is not active.
+    """
+    if lever is not None and lever not in _inactive:
+        _inactive[lever] = reason
+        logger.warning("NOT ACTIVE: %s: %s", lever, reason)
+    return dict(_inactive)
 
 
 def snapshot() -> dict[str, dict[str, int]]:
@@ -99,6 +119,7 @@ def reset() -> None:
     """Clear everything. For tests."""
     _counts.clear()
     _requested.clear()
+    _inactive.clear()
     _warned.clear()
 
 
@@ -109,4 +130,6 @@ def format_census() -> str:
     ]
     for key in shadowed():
         lines.append(f"SHADOWED {key} — enabled, but its site never dispatched to it")
+    for lever, reason in _inactive.items():
+        lines.append(f"NOT ACTIVE {lever} — {reason}")
     return "\n".join(lines) if lines else "(no kernel dispatch recorded)"

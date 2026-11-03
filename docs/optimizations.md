@@ -118,7 +118,7 @@ a hoisted run's files byte for byte.
 
 ## Benchmark Results (RTX 5090, bf16, 2026-03-16)
 
-### Winners (enabled by `--optim recommended`)
+### Winners (2026-03 measurements; the torch.compile rows are in no current preset)
 
 | Optimization                        | Speedup (fwd)             | Memory Savings                     | Where Used                                      | Count       |
 | ----------------------------------- | ------------------------- | ---------------------------------- | ----------------------------------------------- | ----------- |
@@ -138,7 +138,7 @@ a hoisted run's files byte for byte.
 | 512 | 13.3ms / 6.5GB  | 4.3ms / 1.6GB | **3.2ms / 1.7GB** | **4.1x / 3.8x** |
 | 640 | 25.4ms / 12.3GB | 7.7ms / 2.5GB | **5.5ms / 2.6GB** | **4.6x / 4.7x** |
 
-### Conditional winners (enabled by `--optim all`)
+### Conditional winners
 
 | Optimization                       | Speedup                     | Condition                                                          |
 | ---------------------------------- | --------------------------- | ------------------------------------------------------------------ |
@@ -205,6 +205,7 @@ class OptimConfig:
     use_fused_swiglu: bool = False          # Triton multi-row SwiGLU (1.5-2.1x at pair M=N²)
     use_fused_transition_pair: bool = False # Triton fused transition for pair (M=N², C=128)
     use_fused_triangle_mul: bool = False    # Triton dual GEMM + gate fusion for TriangleMul
+    use_cueq_triangle_mul: bool = False     # cuEquivariance TriangleMul (optional cueq group)
     use_fused_ln_transpose: bool = False    # Triton LN+transpose for column attention
     use_fused_msa_transition_inference: bool = False  # in-place forward-only MSA transition (inference preset only)
     use_torch_compile: bool = False         # torch.compile for attention + TriangleMul
@@ -215,12 +216,8 @@ class OptimConfig:
 ```python
 from deepfold3.model.config import ModelConfig, OptimConfig
 
-# Recommended for inference (biggest wins)
 config = ModelConfig()
-config.optim = OptimConfig.recommended()  # evo attention + swiglu + triangle_mul + compile
-
-# Enable everything (including fused transition for training memory savings)
-config.optim = OptimConfig.all_enabled()
+config.optim = OptimConfig.inference()
 
 # Check what's available on this system
 from deepfold3.model.optim import print_availability
@@ -229,24 +226,33 @@ print_availability()
 
 ### CLI
 
+| `--optim` | Kernels | Numerics |
+| --- | --- | --- |
+| `inference` (default) | Triton evo attention, pair bias, SwiGLU, TriangleMul, MSA transition; OPM and MSA chunking | Differs from training within each kernel's error |
+| `train-matched` | What the checkpoint recorded; refuses a checkpoint with no `OptimConfig` | The kernels the weights were fitted through |
+| `none` | Stock PyTorch | Reference; also makes `--matmul-precision auto` use true fp32 |
+| `inference-cueq` | `inference` with cuEquivariance's TriangleMul; needs `uv sync --group cueq` | Not yet measured against the Triton TriMul |
+
 ```bash
-# Recommended: fused evo attention + torch.compile (best inference speed)
-deepfold3 inference --json input.json --output out/ --params weights.safetensors --optim recommended
-
-# All optimizations (adds fused transition — useful for training backward pass memory)
-deepfold3 inference --json input.json --output out/ --params weights.safetensors --optim all
-
-# Triton fused kernels only (no torch.compile)
-deepfold3 inference --json input.json --output out/ --params weights.safetensors --optim triton
+deepfold3 inference --json input.json --output out/ --params weights.safetensors --optim train-matched
 ```
+
+A requested kernel that cannot run is never a silent stock run:
+
+- **Backend not installed:** model construction raises `NotActive`.
+- **Gated by a condition:** the kernel runs stock, logs `NOT ACTIVE` once, and appears under `kernels_inactive` in `run_manifest.json`.
+
+`use_fused_transition_pair` and `use_tiled_linear` are gated to C in (64, 128). At `pair_channel=256` they reach only the C=128 MSA and template transitions, never the pair transitions.
+
+`cuequivariance-ops-torch-cu13` is NVIDIA proprietary software, so the `cueq` group stays optional. Below its own size threshold the package runs its PyTorch path.
 
 ### Recommended Configuration
 
 See the **B200 End-to-End Benchmark** at the top for the measured training/inference numbers these recommendations come from.
 
 - **For training**: the `optim:` block in `configs/initial.yaml` — fused evo-attention + fused dropout-add + the safe pair-scale trio (`use_fused_swiglu`, `use_fused_transition_pair`, `use_fused_triangle_mul`) + gradient checkpointing. `use_fused_pair_bias` stays **off** (bf16 backward gradient blow-up). Do **not** use `--optim all` for training — it enables `pair_bias` (training hazard) and the single/ada transitions (slower at C=384/768).
-- **For inference**: `--optim inference` (= `OptimConfig.inference()`) — all four pair-scale kernels + `ln_transpose` + tiled pair transitions. 1.44–1.49× over baseline. `pair_bias` is safe here (no backward).
-- **Debugging**: omit `--optim` — pure PyTorch, no compiled graphs, easy to debug.
+- **For inference**: `--optim inference`, or `--optim train-matched` to run the kernels the weights were fitted through.
+- **Debugging**: `--optim none` — pure PyTorch, no compiled graphs.
 
 ### Inference output writes
 
@@ -667,8 +673,7 @@ OptimConfig(
 )
 ```
 
-Enabled by default in `OptimConfig.recommended()`. Composable with Triton fused kernels —
-the inner module can be `FusedTransitionBlock` with `FusedSwiGLU`.
+No preset enables it. `make_transition_block` only wraps blocks it did not fuse, at C in (64, 128).
 
 ## Attention Tuning Notes
 

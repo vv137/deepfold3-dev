@@ -660,13 +660,18 @@ class TemplateEmbeddingConfig:
     pairformer: TemplatePairFormerConfig = field(default_factory=TemplatePairFormerConfig)
 
 
+# ``--optim`` names. ``train-matched`` keeps what the checkpoint recorded.
+OPTIM_PRESETS = ("none", "train-matched", "inference", "inference-cueq")
+
+
 @dataclass
 class OptimConfig:
     """Toggle individual kernel optimization backends.
 
-    All flags default to False (pure PyTorch). Set to True to use the
-    corresponding Triton/fused kernel if available; silently falls back
-    to baseline if the backend is not installed.
+    Flags default to False (pure PyTorch). A requested kernel whose backend is
+    not installed refuses at model construction (:meth:`require_backends`). One
+    that a condition gates off, such as a channel count or a CPU tensor, runs
+    stock and is named by ``kernel_census``.
 
     Benchmark results (RTX 5090, bf16, N=384-768):
     Measured at C=128 with trunk triangle attention. Current configs use
@@ -708,6 +713,9 @@ class OptimConfig:
     use_fused_transition_single: bool = False  # single transitions (M=N, C=384) — PyTorch wins, DO NOT enable
     use_fused_ada_transition: bool = False  # diffusion AdaTransitionBlock (M=N, C=768) — PyTorch wins
     use_fused_triangle_mul: bool = False
+    # cuEquivariance triangle multiply (optional ``cueq`` group). Takes precedence
+    # over use_fused_triangle_mul; refuses at construction if not installed.
+    use_cueq_triangle_mul: bool = False
     use_fused_ln_transpose: bool = False
     # Evoformer MSA transition as one in-place forward-only kernel (no [..., 2*hidden]
     # tensor; see model/triton/msa_transition.py). Served only with grad disabled, so
@@ -759,49 +767,16 @@ class OptimConfig:
     )
 
     @classmethod
-    def recommended(cls) -> OptimConfig:
-        """Best overall: evo_attn + pair_bias + swiglu + triangle_mul + pair_transition + compile.
-
-        Only enables Triton kernels where they demonstrably outperform PyTorch.
-        SwiGLU is always safe (wins at pair scale, neutral+memory-saving at single scale).
-        Single/diffusion transitions are left to PyTorch/compile (they're faster at small M).
-        """
-        return cls(
-            use_fused_evo_attention=True,
-            use_fused_pair_bias=True,
-            use_fused_swiglu=True,
-            use_fused_triangle_mul=True,
-            use_fused_transition_pair=True,
-            use_torch_compile=True,
-        )
-
-    @classmethod
-    def recommended_tiled(cls) -> OptimConfig:
-        """Recommended + tiled linear for pair transitions (memory savings).
-
-        Same as recommended() plus tiled chunking for pair-scale transitions.
-        Reduces peak memory for pair transition intermediates [N,N,C*4] by
-        processing chunks of rows sequentially instead of all at once.
-        Applies to both training (recompute backward) and inference (chunked forward).
-
-        torch.compile is disabled: with Triton kernels dominating runtime,
-        compile adds no steady-state benefit but doubles peak memory during
-        the compilation pass (~14 GB vs ~8.7 GB at N=1280).
-        """
-        cfg = cls.recommended()
-        cfg.use_torch_compile = False
-        cfg.use_tiled_linear = True
-        cfg.tiled_linear_inference = True
-        cfg.tiled_opm_chunk = 128
-        return cfg
+    def none(cls) -> OptimConfig:
+        """Stock PyTorch at every dispatch site."""
+        return cls(use_fused_dropout_add=False)
 
     @classmethod
     def inference(cls) -> OptimConfig:
-        """Maximum inference speed + memory efficiency.
+        """Maximum inference speed and memory efficiency.
 
-        All beneficial Triton kernels + tiled pair transitions + forward-only
-        LN+transpose fusion. No torch.compile (Triton kernels dominate; compile
-        adds startup cost with no steady-state benefit).
+        Adds forward-only kernels and MSA chunking to the trained set, so its
+        numerics differ from training within the error of each kernel.
         """
         return cls(
             use_fused_evo_attention=True,
@@ -809,40 +784,72 @@ class OptimConfig:
             use_fused_swiglu=True,
             use_fused_triangle_mul=True,
             use_fused_transition_pair=True,
-            use_fused_ln_transpose=True,
             use_fused_msa_transition_inference=True,
-            use_tiled_linear=True,
-            tiled_linear_inference=True,
             tiled_opm_chunk=128,
             msa_row_chunk=512,
         )
 
     @classmethod
-    def triton_only(cls) -> OptimConfig:
-        """All beneficial Triton kernels without tiling (no torch.compile)."""
-        return cls(
-            use_fused_evo_attention=True,
-            use_fused_pair_bias=True,
-            use_fused_swiglu=True,
-            use_fused_transition_pair=True,
-            use_fused_triangle_mul=True,
-            use_fused_ln_transpose=True,
-        )
+    def inference_cueq(cls) -> OptimConfig:
+        """``inference`` with cuEquivariance serving the triangle multiply.
+
+        Needs the optional ``cueq`` dependency group; construction refuses without it.
+        """
+        cfg = cls.inference()
+        cfg.use_fused_triangle_mul = False
+        cfg.use_cueq_triangle_mul = True
+        return cfg
 
     @classmethod
-    def all_enabled(cls) -> OptimConfig:
-        """Enable ALL optimizations including slow ones (for testing)."""
-        return cls(
-            use_fused_evo_attention=True,
-            use_fused_pair_bias=True,
-            use_fused_swiglu=True,
-            use_fused_transition_pair=True,
-            use_fused_transition_single=True,
-            use_fused_ada_transition=True,
-            use_fused_triangle_mul=True,
-            use_fused_ln_transpose=True,
-            use_torch_compile=True,
-        )
+    def from_preset(cls, name: str, checkpoint: OptimConfig | None) -> OptimConfig:
+        """Resolve a ``--optim`` name.
+
+        Args:
+            name: One of :data:`OPTIM_PRESETS`.
+            checkpoint: The config the checkpoint recorded, or ``None`` if it has none.
+
+        Returns:
+            The config to build the model with.
+
+        Raises:
+            ValueError: ``train-matched`` was asked for and the checkpoint records no config.
+        """
+        if name == "train-matched":
+            if checkpoint is None:
+                raise ValueError("--optim train-matched needs a checkpoint that records its OptimConfig")
+            return checkpoint
+        return {"none": cls.none, "inference": cls.inference, "inference-cueq": cls.inference_cueq}[name]()
+
+    def require_backends(self) -> None:
+        """Refuse a requested kernel whose backend cannot be imported.
+
+        ``use_fused_dropout_add`` is exempt: it defaults on, so it is not a request.
+
+        Raises:
+            NotActive: A requested Triton kernel has no Triton to run on.
+        """
+        levers = [
+            f
+            for f in (
+                "use_fused_evo_attention",
+                "use_fused_pair_bias",
+                "use_fused_swiglu",
+                "use_fused_transition_pair",
+                "use_fused_transition_single",
+                "use_fused_ada_transition",
+                "use_fused_triangle_mul",
+                "use_fused_ln_transpose",
+                "use_fused_msa_transition_inference",
+            )
+            if getattr(self, f)
+        ]
+        if not levers:
+            return
+        from deepfold3.model.inference_guard import NotActive
+        from deepfold3.model.triton import HAS_TRITON
+
+        if not HAS_TRITON:
+            raise NotActive(levers[0], f"Triton is not installed; also requested: {levers[1:]}")
 
 
 @dataclass
