@@ -206,6 +206,7 @@ class OptimConfig:
     use_fused_transition_pair: bool = False # Triton fused transition for pair (M=N², C=128)
     use_fused_triangle_mul: bool = False    # Triton dual GEMM + gate fusion for TriangleMul
     use_cueq_triangle_mul: bool = False     # cuEquivariance TriangleMul (optional cueq group)
+    use_channel_major_triangle_mul: bool = False  # channel-first TriangleMul with a fused backward
     use_fused_ln_transpose: bool = False    # Triton LN+transpose for column attention
     use_fused_msa_transition_inference: bool = False  # in-place forward-only MSA transition (inference preset only)
     use_torch_compile: bool = False         # torch.compile for attention + TriangleMul
@@ -228,14 +229,29 @@ print_availability()
 
 | `--optim` | Kernels | Numerics |
 | --- | --- | --- |
-| `inference` (default) | Triton evo attention, pair bias, SwiGLU, TriangleMul, MSA transition; OPM and MSA chunking | Differs from training within each kernel's error |
+| `inference` (default) | Triton evo attention, pair bias, SwiGLU, channel-major TriangleMul, MSA transition; OPM and MSA chunking | Differs from training within each kernel's error |
 | `train-matched` | What the checkpoint recorded; refuses a checkpoint with no `OptimConfig` | The kernels the weights were fitted through |
 | `none` | Stock PyTorch | Reference; also makes `--matmul-precision auto` use true fp32 |
-| `inference-cueq` | `inference` with cuEquivariance's TriangleMul; needs `uv sync --group cueq` | Not yet measured against the Triton TriMul |
+| `inference-cueq` | `inference` with cuEquivariance's TriangleMul; needs `uv sync --group cueq` | Slower than the channel-major TriangleMul, see below |
 
 ```bash
 deepfold3 inference --json input.json --output out/ --params weights.safetensors --optim train-matched
 ```
+
+### Channel-major TriangleMul
+
+`use_channel_major_triangle_mul` (`triton/fused_trimul.py`) keeps the contraction operands as contiguous `[C, N, N]` planes. Its forward is three launches ported from Anthropic's `fpf_trimul_v4` (Apache-2.0, see `fused_trimul.NOTICE`); the backward is ours, on the cuEquivariance training design: the forward saves its planes, the backward recomputes nothing and uses two fused VJP kernels plus cuBLAS GEMMs.
+
+Real activations from `checkpoint_120000` under bf16 autocast, 42 captures, RTX 6000 Ada, torch 2.13, cuEquivariance 0.13. Error is RMS against stock fp32 relative to stock bf16; gradient error is the medians for `z` against stock fp32. Single module, N=640:
+
+| Kernel | fwd | fwd+bwd | Peak fwd+bwd | Output error | `z` gradient error |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Stock | 24.8 ms | 79.2 ms | 6.61 GiB | 1.000 | 7.52e-3 |
+| Level 3 dual GEMM | 18.6 ms | 63.4 ms | 5.23 GiB | 1.173 | 7.69e-3 |
+| cuEquivariance | 13.8 ms | 45.6 ms | 5.23 GiB | 0.824 | 5.35e-3 |
+| **Channel-major** | **4.0 ms** | **30.5 ms** | 6.60 GiB | 0.824 | **4.52e-3** |
+
+GEMMs are not the cost: one takes 0.8 ms at this shape, while the output LayerNorm and its autograd backward take 36 ms. Calls the kernels cannot serve (CPU, C=64, fp32 GEMMs, N < 101) run the same layout in plain torch and are no faster than stock in fwd+bwd. Training presets leave the flag off. Tiles come from `persistent_autotune` like the other fused kernels, so run `deepfold3 warmup-triton` before enabling the flag in DDP training; `--det` serves the first config of each list.
 
 A requested kernel that cannot run is never a silent stock run:
 

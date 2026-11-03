@@ -39,7 +39,7 @@ def test_none_is_stock():
 
 def test_cueq_preset_replaces_the_triton_trimul():
     cfg = OptimConfig.inference_cueq()
-    assert cfg.use_cueq_triangle_mul and not cfg.use_fused_triangle_mul
+    assert cfg.use_cueq_triangle_mul and not cfg.use_channel_major_triangle_mul
 
 
 def test_missing_triton_refuses(monkeypatch):
