@@ -70,6 +70,10 @@ class ConfidenceHead(nn.Module):
         c_pair = cfg.pair_channel
         c_single = cfg.seq_channel
         self.fp32 = fp32
+        # Checkpoint each PairFormer layer as well as the whole sample (below):
+        # with the sample alone, its backward recompute holds all four layers'
+        # intermediates at once, which ran a 640-token crop out of a 95 GB GH200.
+        self._grad_checkpoint = bool(optim and optim.use_gradient_checkpointing)
 
         # _embed_features: target_feat outer-sum + distogram from positions
         self.left_target_feat_project = LinearNoBias(target_feat_dim, c_pair)
@@ -287,8 +291,12 @@ class ConfidenceHead(nn.Module):
 
         pair_act = pair_act + self._embed_features(target_feat, positions, pair_mask)
 
+        use_ckpt = self._grad_checkpoint and torch.is_grad_enabled()
         for layer in self.layers:
-            pair_act, single_act = layer(pair_act, single_act, pair_mask, seq_mask)
+            if use_ckpt:
+                pair_act, single_act = torch_checkpoint(layer, pair_act, single_act, pair_mask, seq_mask)
+            else:
+                pair_act, single_act = layer(pair_act, single_act, pair_mask, seq_mask)
 
         # fp32_scope is what actually holds LN + matmul in fp32: a bare
         # ``.float()`` upcast is otherwise re-downcast by autocast on entry.

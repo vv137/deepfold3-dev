@@ -26,10 +26,10 @@ training:
   # stage2's 13.5 atoms per token (6912 / 512) at 640 tokens.
   max_atoms: 8640
 
-  # Same 32 noise levels per crop as stage2, so the per-step gradient noise of
-  # the diffusion loss is unchanged. Chunking splits the backward only (same
-  # gradients); halve it to 2 if the 640 smoke test runs out of memory.
-  diffusion_batch_size: 32
+  # 48 noise levels per crop (AF3's value; stage1/2 used 32). Chunking splits
+  # the backward only (same gradients); chunk 2 did not fix the 640 OOM, which
+  # was in the confidence head.
+  diffusion_batch_size: 48
   diffusion_chunk_size: 4
 
   lr: 0.9e-3
