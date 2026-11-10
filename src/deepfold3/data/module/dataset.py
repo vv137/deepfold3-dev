@@ -979,6 +979,7 @@ def _tokenize_and_featurize(
     max_msa_seqs: int = const.MAX_MSA_ROWS,
     templates: list[TemplateFeatures] | None = None,
     template_feats_per_chain: dict[int, list[TemplateFeatures]] | None = None,
+    dedup_unpaired_against_paired: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Shared tokenize -> featurize pipeline for inference inputs.
 
@@ -988,9 +989,11 @@ def _tokenize_and_featurize(
     residue index. Either way the index comes from ``msa_col_idx``, so a chain
     holding a modified residue — which tokenizes to one token per atom — keeps
     its templates on the right residues instead of shifting everything after it.
+    ``dedup_unpaired_against_paired`` is set for species-paired inputs; see
+    ``Featurizer``.
     """
     tokenizer = Tokenizer()
-    featurizer = Featurizer(max_msa_seqs=max_msa_seqs)
+    featurizer = Featurizer(max_msa_seqs=max_msa_seqs, dedup_unpaired_against_paired=dedup_unpaired_against_paired)
     tokenized = tokenizer.tokenize(inp)
     if template_feats_per_chain:
         col_idx = tokenized.query_col_idx
@@ -1103,6 +1106,7 @@ class InferenceInput:
         max_templates: int = 4,
         template_cache_dir: str | Path | None = None,
         pdb_mmcif_dir: str | Path | None = None,
+        msa_pairing: str = "auto",
     ) -> dict[str, torch.Tensor]:
         """Build features from a Protenix-format or AF3-format JSON input file.
 
@@ -1120,6 +1124,8 @@ class InferenceInput:
             template_cache_dir: Directory to cache downloaded template mmCIF files.
             pdb_mmcif_dir: Optional local PDB mmCIF mirror directory
                 (layout: ``{dir}/{mid2}/{id}.cif.gz``).
+            msa_pairing: ``"auto"``, ``"precomputed"`` or ``"species"``; see
+                ``parse_json_input``.
 
         Returns:
             dict[str, torch.Tensor] ready for model.forward().
@@ -1128,7 +1134,11 @@ class InferenceInput:
 
         json_path = Path(json_path)
         jobs = parse_json_input(
-            json_path, max_templates=max_templates, template_cache_dir=template_cache_dir, pdb_mmcif_dir=pdb_mmcif_dir
+            json_path,
+            max_templates=max_templates,
+            template_cache_dir=template_cache_dir,
+            pdb_mmcif_dir=pdb_mmcif_dir,
+            msa_pairing=msa_pairing,
         )
 
         if job_index >= len(jobs):
@@ -1240,6 +1250,10 @@ class InferenceInput:
             inp,
             max_msa_seqs=max_msa_seqs,
             template_feats_per_chain=template_feats_per_chain or None,
+            # Species-paired blocks are built from raw UniProt hits, so (as in
+            # OF3 / AF3) unpaired rows repeating a paired row are dropped.
+            dedup_unpaired_against_paired=getattr(job, "msa_pairing", "precomputed") == "species"
+            and bool(paired_msa_dict),
         )
 
 

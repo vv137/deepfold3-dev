@@ -6,6 +6,7 @@ Feature specifications follow AlphaFold3 exactly.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -13,10 +14,13 @@ import torch
 
 from deepfold3.data import const
 from deepfold3.data.feature.ref_atoms import _encode_atom_name, get_ref_atoms
+from deepfold3.data.msa.pairing import unpaired_rows_not_in_paired
 from deepfold3.data.types import MSA, Tokenized
 
 if TYPE_CHECKING:
     from deepfold3.data.parse.templates import TemplateFeatures
+
+logger = logging.getLogger(__name__)
 
 
 def _random_rotation_matrix(rng: np.random.Generator) -> np.ndarray:
@@ -44,8 +48,16 @@ class Featurizer:
         n_msa_crops: int = 0,
         ccd_atom_order: dict[str, list[str]] | None = None,
         pad_templates: bool = False,
+        dedup_unpaired_against_paired: bool = False,
     ):
         self.max_atoms = max_atoms
+        # Drop each chain's unpaired rows that already appear (residue-identical)
+        # among its paired rows, as OF3 ``create_main`` / AF3 do after online
+        # species pairing. Off by default: precomputed paired MSAs (ColabFold
+        # ``pairaln``) were never deduplicated, and training does not do it.
+        # ``profile`` / ``deletion_mean`` still use the full unpaired MSA (OF3
+        # computes them from the redundant main MSA).
+        self.dedup_unpaired_against_paired = dedup_unpaired_against_paired
         self.max_msa_seqs = max_msa_seqs
         self.max_templates = max_templates
         # Emit a fixed ``T == max_templates`` template axis instead of the
@@ -986,8 +998,17 @@ class Featurizer:
         # paired-synthesis branch already consumed for homo-multimer chains).
         chain_unpaired: list[tuple[int, np.ndarray, np.ndarray, np.ndarray]] = []
         max_S_unpaired = 0
+        n_dropped: dict[int, int] = {}
         for asym_id, msa in data.unpaired_msa.items():
             skip = unpaired_skip.get(int(asym_id), 1)
+            paired = data.paired_msa.get(asym_id) if self.dedup_unpaired_against_paired else None
+            if paired is not None:
+                keep = unpaired_rows_not_in_paired(msa, paired)
+                if not keep.all():
+                    n_dropped[int(asym_id)] = int((~keep).sum())
+                    msa = MSA(
+                        sequences=msa.sequences[keep], mask=msa.mask[keep], deletion_matrix=msa.deletion_matrix[keep]
+                    )
             if msa.sequences.shape[0] <= skip:
                 continue
             end = min(msa.sequences.shape[0], skip + max_unpaired)
@@ -1000,6 +1021,8 @@ class Featurizer:
                 )
             )
             max_S_unpaired = max(max_S_unpaired, end - skip)
+        if self.dedup_unpaired_against_paired:
+            logger.info("MSA pairing: dropped unpaired rows already in the paired block, per asym_id %s", n_dropped)
 
         if max_S_unpaired > 0:
             # Build dense [max_S_unpaired, N] arrays — all chains on same rows

@@ -76,9 +76,33 @@ def parse_a3m(text: str, mol_type: int = const.MOL_PROTEIN) -> MSA:
         mask      [S, N] bool   (always True for non-gap positions)
         deletion_matrix [S, N] int8
     """
-    # Split into (header, sequence) pairs
+    return _encode_records(_split_records(text)[1], mol_type)
+
+
+def parse_a3m_with_headers(text: str, mol_type: int = const.MOL_PROTEIN) -> tuple[MSA, list[str]]:
+    """Parse an A3M string and keep each row's header.
+
+    Same rows as :func:`parse_a3m` (a header with no sequence lines yields no
+    row), so ``headers[i]`` describes ``msa.sequences[i]``.
+
+    Args:
+        text: A3M text.
+        mol_type: ``MOL_PROTEIN`` / ``MOL_RNA`` / ``MOL_DNA``.
+
+    Returns:
+        ``(msa, headers)``; each header is the text after ``>`` (``""`` for a
+        row with no header line).
+    """
+    headers, seqs = _split_records(text)
+    return _encode_records(seqs, mol_type), headers
+
+
+def _split_records(text: str) -> tuple[list[str], list[str]]:
+    """Split A3M text into parallel ``(headers, sequences)`` lists."""
+    headers: list[str] = []
     seqs: list[str] = []
     current_seq: list[str] = []
+    current_header = ""
 
     for line in text.splitlines():
         line = line.strip()
@@ -86,13 +110,20 @@ def parse_a3m(text: str, mol_type: int = const.MOL_PROTEIN) -> MSA:
             continue
         if line.startswith(">"):
             if current_seq:
+                headers.append(current_header)
                 seqs.append("".join(current_seq))
                 current_seq = []
+            current_header = line[1:]
         else:
             current_seq.append(line)
     if current_seq:
+        headers.append(current_header)
         seqs.append("".join(current_seq))
+    return headers, seqs
 
+
+def _encode_records(seqs: list[str], mol_type: int) -> MSA:
+    """Encode A3M row strings into an :class:`MSA` (query = row 0 sets the width)."""
     if not seqs:
         # Return single empty sequence
         return MSA(

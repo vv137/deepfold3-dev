@@ -59,6 +59,7 @@ from pathlib import Path
 import click
 import torch
 
+from deepfold3.data.msa.pairing import MSA_PAIRING_MODES
 from deepfold3.model.config import OPTIM_PRESETS
 from deepfold3.model.guidance import (
     GuidanceSpec,
@@ -199,6 +200,13 @@ def _save_logits(save, path: Path, *args, **kwargs) -> None:
     default=None,
     type=click.Path(exists=True, path_type=Path),
     help="Local PDB mmCIF mirror directory (layout: {dir}/{mid2}/{id}.cif.gz)",
+)
+@click.option(
+    "--msa-pairing",
+    default="auto",
+    type=click.Choice(MSA_PAIRING_MODES),
+    show_default=True,
+    help="How each chain's pairedMsa is used (JSON input). precomputed: rows are already paired across chains (row i of every chain is one paired row; ColabFold/MMseqs2 pairaln output). species: pairedMsa is each chain's raw UniProt hits (AF3 semantics); rows are paired by species as AF3/OpenFold3 do, and unpaired rows repeating a paired row are dropped. auto: species only when >=2 distinct protein chains have paired MSAs whose headers carry UniProt species ids and whose row counts differ, else precomputed.",
 )
 @click.option(
     "--optim",
@@ -418,6 +426,7 @@ def inference(
     templates: Path | None,
     template_cache: Path | None,
     pdb_mmcif_dir: Path | None,
+    msa_pairing: str,
     optim: str | None,
     matmul_precision: str,
     plot_confidences: bool,
@@ -578,6 +587,7 @@ def inference(
     from deepfold3.data.module.dataset import InferenceInput
 
     job_name: str | None = None
+    msa_pairing_used: str | None = None
     entity_descriptions: dict[str, str] | None = None
     job_title: str | None = None
     chain_names: list[str | None] | None = None
@@ -585,11 +595,15 @@ def inference(
         click.echo(f"[inference] featurizing {json_input} …")
         from deepfold3.data.parse.json_input import parse_json_input
 
-        jobs = parse_json_input(json_input, template_cache_dir=template_cache, pdb_mmcif_dir=pdb_mmcif_dir)
+        jobs = parse_json_input(
+            json_input, template_cache_dir=template_cache, pdb_mmcif_dir=pdb_mmcif_dir, msa_pairing=msa_pairing
+        )
         if not jobs:
             raise click.UsageError("No jobs found in JSON input")
         job = jobs[0]
         job_name = job.name
+        msa_pairing_used = job.msa_pairing
+        click.echo(f"[inference] MSA pairing: {msa_pairing_used} (--msa-pairing {msa_pairing})")
         job_title = job.description or job.name
 
         # Chain names as written in the input JSON, in asym_id order. Without
@@ -755,6 +769,7 @@ def inference(
         num_samples=num_samples,
         num_recycles=num_recycles,
         msa_crop_size=model_cfg.msa_crop_size,
+        msa_pairing={"requested": msa_pairing, "resolved": msa_pairing_used},
         bucket={"enabled": use_bucket, "num_tokens": original_n, "padded_tokens": feats["res_type"].shape[0]},
         guidance=[{**asdict(g), "description": _describe_guidance(g)} for g in guidance_specs],
         restraints=[

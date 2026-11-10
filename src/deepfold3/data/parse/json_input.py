@@ -41,8 +41,11 @@ import logging
 from dataclasses import field
 from pathlib import Path
 
+import numpy as np
+
 from deepfold3.data import const
-from deepfold3.data.parse.a3m import parse_a3m
+from deepfold3.data.msa.pairing import MSA_PAIRING_MODES, pair_by_species, species_fraction, species_ids
+from deepfold3.data.parse.a3m import parse_a3m, parse_a3m_with_headers
 from deepfold3.data.parse.templates import TemplateHitInput, fetch_pdb_mmcif, release_date_from_mmcif_text
 from deepfold3.data.types import MSA
 
@@ -69,6 +72,9 @@ class ProteinChainInput:
             caller asked for instead of synthetic A, B, C, … ``None`` for
             dialects that do not name chains (AlphaFold-Server, Protenix), which
             fall back to the synthetic naming.
+        paired_msa_species: UniProt species id of each ``paired_msa`` row
+            (``""`` where the header has none), used by species pairing.
+            Cleared once :func:`parse_json_input` has resolved the pairing.
     """
 
     sequence: str
@@ -79,6 +85,7 @@ class ProteinChainInput:
     modifications: list[tuple[str, int]] = field(default_factory=list)
     description: str | None = None
     chain_id: str | None = None
+    paired_msa_species: np.ndarray | None = None
 
 
 @dataclasses.dataclass
@@ -157,6 +164,10 @@ class JobInput:
             Mirrors AlphaFold 3's ``--max_template_date`` CLI flag (set
             from the top-level ``maxTemplateDate`` JSON field).
         description: Optional job description (written as _struct.title in mmCIF).
+        msa_pairing: How the paired MSAs were resolved: ``"precomputed"``
+            (row-aligned as given) or ``"species"`` (paired by species at parse
+            time; the featurizer then drops unpaired rows already in the paired
+            block). Set by :func:`parse_json_input`.
     """
 
     name: str
@@ -169,6 +180,7 @@ class JobInput:
     user_ccd: str | None = None
     max_template_date: str | None = None
     description: str | None = None
+    msa_pairing: str = "precomputed"
 
 
 _DNA_KEYS = ("dnaSequence", "dnaChain")
@@ -180,6 +192,7 @@ def parse_json_input(
     max_templates: int = 4,
     template_cache_dir: str | Path | None = None,
     pdb_mmcif_dir: str | Path | None = None,
+    msa_pairing: str = "auto",
 ) -> list[JobInput]:
     """Parse a JSON input file (auto-detects dialect).
 
@@ -193,14 +206,20 @@ def parse_json_input(
         template_cache_dir: Directory to cache downloaded template mmCIF files.
         pdb_mmcif_dir: Optional local PDB mmCIF mirror directory
             (layout: ``{dir}/{mid2}/{id}.cif.gz``).
+        msa_pairing: ``"precomputed"`` (paired MSAs are row-aligned, e.g.
+            ColabFold ``pairaln`` output), ``"species"`` (paired MSAs are raw
+            per-chain UniProt hits, paired by species as AF3/OF3 do) or
+            ``"auto"`` (see :func:`resolve_msa_pairing_mode`).
 
     Returns:
         List of JobInput objects, one per job entry.
 
     Raises:
         ValueError: If the JSON contains unsupported entity types or invalid
-            chain counts.
+            chain counts, or ``msa_pairing`` is not a known mode.
     """
+    if msa_pairing not in MSA_PAIRING_MODES:
+        raise ValueError(f"msa_pairing must be one of {MSA_PAIRING_MODES}, got {msa_pairing!r}")
     json_path = Path(json_path)
     base_dir = json_path.parent
 
@@ -226,6 +245,7 @@ def parse_json_input(
             job = _parse_deepfold3_entry(entry, base_dir, max_templates, cache_dir, pdb_dir)
         job.max_template_date = _parse_max_template_date(entry.get("maxTemplateDate"))
         _filter_template_hits_by_date(job)
+        _apply_msa_pairing(job, msa_pairing)
         jobs.append(job)
 
     return jobs
@@ -309,7 +329,7 @@ def _parse_af3_entry(
             ids = _ensure_id_list(p.get("id", []))
             seq = p["sequence"]
             unpaired = _resolve_msa(base_dir, const.MOL_PROTEIN, p.get("unpairedMsaPath"), p.get("unpairedMsa"))
-            paired = _resolve_msa(base_dir, const.MOL_PROTEIN, p.get("pairedMsaPath"), p.get("pairedMsa"))
+            paired, paired_species = _resolve_paired_msa(base_dir, p.get("pairedMsaPath"), p.get("pairedMsa"))
             # Templates: inline list or file path
             tmpl_hits = _resolve_af3_templates(base_dir, p.get("templates"), max_templates, cache_dir, pdb_mmcif_dir)
             if not tmpl_hits:
@@ -325,6 +345,7 @@ def _parse_af3_entry(
                         sequence=seq,
                         count=1,
                         paired_msa=paired,
+                        paired_msa_species=paired_species,
                         unpaired_msa=unpaired,
                         template_hits=tmpl_hits,
                         modifications=list(mods),
@@ -651,12 +672,14 @@ def _parse_protenix_entry(
                         if non_pairing_file.exists():
                             unpaired_path = str(non_pairing_file)
             mods = _parse_modifications(pc.get("modifications"))
+            paired, paired_species = _resolve_paired_msa(base_dir, paired_path, None)
             for _ in range(count):
                 protein_chains.append(
                     ProteinChainInput(
                         sequence=pc["sequence"],
                         count=1,
-                        paired_msa=_resolve_msa(base_dir, const.MOL_PROTEIN, paired_path, None),
+                        paired_msa=paired,
+                        paired_msa_species=paired_species,
                         unpaired_msa=_resolve_msa(base_dir, const.MOL_PROTEIN, unpaired_path, None),
                         template_hits=_resolve_template_hits(
                             base_dir, pc.get("templatesPath"), max_templates, cache_dir, pdb_mmcif_dir
@@ -919,24 +942,185 @@ def _resolve_msa(base_dir: Path, mol_type: int, path_str: str | None, inline_str
     Returns:
         Parsed MSA object, or None if neither path nor inline string is provided.
     """
+    text = _read_msa_text(base_dir, path_str, inline_str)
+    if text is None:
+        return None
+    msa = parse_a3m(text, mol_type)
+    return msa if msa.sequences.shape[0] > 0 else None
+
+
+def _resolve_paired_msa(
+    base_dir: Path, path_str: str | None, inline_str: str | None
+) -> tuple[MSA | None, np.ndarray | None]:
+    """Resolve a protein paired MSA and the species id of each row.
+
+    Same resolution as :func:`_resolve_msa`; the headers are kept as species ids
+    so the job-level pass (:func:`_apply_msa_pairing`) can pair rows by species.
+
+    Returns:
+        ``(msa, species)``, or ``(None, None)`` when there is no MSA.
+    """
+    text = _read_msa_text(base_dir, path_str, inline_str)
+    if text is None:
+        return None, None
+    msa, headers = parse_a3m_with_headers(text, const.MOL_PROTEIN)
+    if msa.sequences.shape[0] == 0:
+        return None, None
+    return msa, species_ids(headers)
+
+
+def _read_msa_text(base_dir: Path, path_str: str | None, inline_str: str | None) -> str | None:
+    """A3M text from a path (preferred) or inline string; ``None`` if absent or unreadable."""
     if path_str is not None:
         resolved = _resolve_path(base_dir, path_str)
         if resolved is not None:
             try:
-                text = resolved.read_text()
-                msa = parse_a3m(text, mol_type)
-                if msa.sequences.shape[0] > 0:
-                    return msa
+                return resolved.read_text()
             except (FileNotFoundError, OSError) as e:
                 logger.warning("Failed to read MSA file %s: %s", resolved, e)
         return None
-
     if inline_str is not None and inline_str.strip():
-        msa = parse_a3m(inline_str, mol_type)
-        if msa.sequences.shape[0] > 0:
-            return msa
-
+        return inline_str
     return None
+
+
+# ---------------------------------------------------------------------------
+# MSA pairing (job-level pass)
+# ---------------------------------------------------------------------------
+
+
+def resolve_msa_pairing_mode(job: JobInput, mode: str) -> tuple[str, str]:
+    """Pick ``precomputed`` or ``species`` for one job.
+
+    ``auto`` selects ``species`` only when the paired MSAs are evidently raw
+    per-chain UniProt hits: at least two distinct protein sequences carry a
+    paired MSA with hits, every one of them has a UniProt species id on at least
+    half of its non-query rows, and their row counts differ. Anything else —
+    ColabFold/MMseqs2 ``pairaln`` output (``UniRef100_…`` / ``DUMMY`` headers,
+    equal row counts), monomers, homomers — stays ``precomputed``, i.e. exactly
+    the behaviour before this option existed. The JSON dialect is deliberately
+    not consulted: FoldBench writes both kinds of input as ``"alphafold3"``.
+
+    Args:
+        job: Parsed job (paired MSAs and species ids already attached).
+        mode: ``"auto"``, ``"precomputed"`` or ``"species"``.
+
+    Returns:
+        ``(resolved_mode, reason)``.
+
+    Raises:
+        ValueError: On an unknown mode.
+    """
+    if mode not in MSA_PAIRING_MODES:
+        raise ValueError(f"msa_pairing must be one of {MSA_PAIRING_MODES}, got {mode!r}")
+    if mode != "auto":
+        return mode, "requested"
+    reps = _paired_reps(job)
+    if len(reps) < 2:
+        return "precomputed", "fewer than two distinct protein chains with paired hits"
+    fractions = [species_fraction(c.paired_msa_species) for c in reps.values()]
+    depths = {c.paired_msa.sequences.shape[0] for c in reps.values()}
+    if min(fractions) < 0.5:
+        return "precomputed", "paired MSA headers carry no UniProt species ids"
+    if len(depths) == 1:
+        return "precomputed", "paired MSAs are already row-aligned (equal row counts)"
+    return "species", "raw UniProt hits with per-chain row counts"
+
+
+def _paired_reps(job: JobInput) -> dict[str, ProteinChainInput]:
+    """One protein chain per distinct sequence whose paired MSA has hits beyond the query."""
+    reps: dict[str, ProteinChainInput] = {}
+    for c in job.protein_chains:
+        if c.paired_msa is not None and c.paired_msa.sequences.shape[0] > 1:
+            reps.setdefault(c.sequence, c)
+    return reps
+
+
+def _apply_msa_pairing(job: JobInput, mode: str) -> None:
+    """Resolve the pairing mode for ``job`` and, for ``species``, pair rows in place.
+
+    ``precomputed`` leaves every paired MSA untouched (row *i* of each chain is
+    taken to be paired with row *i* of the others). ``species`` follows OF3
+    ``MsaSampleProcessorInference.create_paired_msa``:
+
+    - a monomer or homomer (one distinct protein sequence) is not paired, and its
+      paired MSA is dropped, as OF3 does (its UniProt hits are not part of the
+      main MSA either; DF3 ``format: of3pdb`` training does the same) — the
+      featurizer then synthesises homomer paired rows from the unpaired MSA;
+    - otherwise the distinct protein sequences with hits are paired with
+      :func:`pair_by_species` and every copy of a sequence gets that sequence's
+      row-aligned block; chains with no pairable hits get none (gaps in the
+      paired rows);
+    - non-protein paired MSAs are dropped (only proteins are paired).
+
+    Logs one line per job with the mode and the resulting paired depth.
+    """
+    resolved, reason = resolve_msa_pairing_mode(job, mode)
+    job.msa_pairing = resolved
+    name = job.name
+    if resolved == "precomputed":
+        depths = [c.paired_msa.sequences.shape[0] for c in job.protein_chains if c.paired_msa is not None]
+        if len(set(depths)) > 1:
+            logger.warning(
+                "[%s] MSA pairing: precomputed (%s) but paired row counts differ per chain %s; rows are zipped by "
+                "index and shorter chains gap-padded. Use --msa-pairing species for raw per-chain UniProt hits.",
+                name,
+                reason,
+                depths,
+            )
+        else:
+            logger.info("[%s] MSA pairing: precomputed (%s); paired rows per chain %s", name, reason, depths or "none")
+        for c in job.protein_chains:
+            c.paired_msa_species = None
+        return
+
+    for c in (*job.dna_chains, *job.rna_chains):
+        c.paired_msa = None
+    reps = _paired_reps(job)
+    before = {seq: c.paired_msa.sequences.shape[0] - 1 for seq, c in reps.items()}
+    n_distinct = len({c.sequence for c in job.protein_chains})
+    result = None
+    if n_distinct >= 2 and len(reps) >= 2:
+        seqs = list(reps)
+        species = [
+            c.paired_msa_species
+            if c.paired_msa_species is not None
+            else np.full(c.paired_msa.sequences.shape[0], "", dtype=object)  # no headers kept (MSA server path)
+            for c in (reps[s] for s in seqs)
+        ]
+        result = pair_by_species([reps[s].paired_msa for s in seqs], species)
+
+    paired_by_seq: dict[str, MSA] = {}
+    if result is not None:
+        paired_by_seq = dict(zip(seqs, result.msas, strict=True))
+        logger.info(
+            "[%s] MSA pairing: species (%s); %d paired rows (+query) from hits per sequence %s; "
+            "rows with a hit per sequence %s",
+            name,
+            reason,
+            result.n_rows,
+            list(before.values()),
+            result.rows_per_chain,
+        )
+    elif n_distinct < 2:
+        logger.info("[%s] MSA pairing: species (%s); monomer/homomer, pairing skipped (AF3/OF3)", name, reason)
+    else:
+        logger.info(
+            "[%s] MSA pairing: species (%s); no species shared by two chains (hits per sequence %s), no paired rows",
+            name,
+            reason,
+            list(before.values()),
+        )
+    for c in job.protein_chains:
+        c.paired_msa = paired_by_seq.get(c.sequence)
+        c.paired_msa_species = None
+        if c.paired_msa is None and c.unpaired_msa is None and before.get(c.sequence, 0) > 0:
+            logger.warning(
+                "[%s] MSA pairing: chain %s has paired hits but no unpaired MSA and was not paired; "
+                "it falls back to a single-sequence MSA",
+                name,
+                c.chain_id or c.sequence[:20],
+            )
 
 
 # ---------------------------------------------------------------------------

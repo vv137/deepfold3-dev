@@ -340,6 +340,16 @@ Each chain gets its own paired A3M file. Row _i_ in chain A's paired A3M and row
 
 For server mode (ColabFold API), the server runs `pairgreedy` or `paircomplete` modes internally and returns paired tar.gz alongside unpaired results.
 
+#### Inference: precomputed vs species pairing (`--msa-pairing`)
+
+A JSON `pairedMsa` / `pairedMsaPath` means one of two things, and `deepfold3 inference` / `inference-batch --msa-pairing {auto,precomputed,species}` (`parse_json_input(msa_pairing=…)`) selects which:
+
+- **`precomputed`** — rows are already paired (ColabFold `pairaln` above): row _i_ of every chain is one paired row. Used as-is; shorter chains are gap-padded.
+- **`species`** — each chain's `pairedMsa` is its raw UniProt hit list (AF3 semantics; per-chain row counts differ). `data/msa/pairing.py` pairs rows by species as OpenFold3's `create_paired` does: species = AF3's UniProt mnemonic regex on the header (`tr|A0A3L7GYM1|A0A3L7GYM1_CRIGR/53-158 …` → `CRIGR`; UniRef/`DUMMY` rows have none and never pair), ≤600 rows per species per chain, species shared by ≥2 chains only, tiers from all chains down to 2 (a species' leftover rows are re-paired at the next tier), the _r_-th hit of a species pairs with the _r_-th hit in every other chain, chains absent from a row get gaps, and beyond 8,191 rows each tier is ranked by the product of source-row indices and truncated. Pairing is per distinct protein sequence; copies share the block. A monomer/homomer is not paired and its paired MSA is dropped (OF3, and `format: of3pdb` training) — the featurizer then synthesises homomer paired rows from the unpaired MSA. Non-protein paired MSAs are dropped. The featurizer then removes each chain's unpaired rows that repeat one of its paired rows (OF3 `create_main` / AF3); `profile` / `deletion_mean` still use the full unpaired MSA.
+- **`auto`** (default) — `species` only if ≥2 distinct protein chains have paired hits, each with UniProt species ids on ≥50% of non-query rows, **and** their row counts differ; otherwise `precomputed`, i.e. the pre-option behaviour. The dialect is not consulted: FoldBench writes both kinds as `"dialect": "alphafold3"`. A precomputed job with unequal paired row counts logs a warning.
+
+One log line per job records the mode, the reason, and the paired row count; `run_manifest.json` records `msa_pairing.{requested,resolved}`.
+
 #### Storage
 
 Paired and unpaired MSAs are stored as **separate sharded NPZ trees**:
@@ -540,7 +550,7 @@ def parse_hhr(hhr_text: str) -> list[TemplateHit]:
 ### JSON Input (`data/parse/json_input.py`)
 
 ```python
-def parse_json_input(json_path: Path, max_templates=4, template_cache_dir=None) -> list[JobInput]:
+def parse_json_input(json_path: Path, max_templates=4, template_cache_dir=None, pdb_mmcif_dir=None, msa_pairing="auto") -> list[JobInput]:
 ```
 
 - Auto-detects and parses four JSON dialects: `alphafold3`, `alphafoldserver`, `protenix`, `deepfold3`
@@ -549,6 +559,7 @@ def parse_json_input(json_path: Path, max_templates=4, template_cache_dir=None) 
 - **protenix**: faithful to Protenix — `msa.precomputed_msa_dir` or `pairedMsaPath`/`unpairedMsaPath`
 - **deepfold3**: our superset accepting both AF3 and Protenix key styles
 - All file I/O (reading A3M files, downloading template CIFs) happens at parse time
+- Paired MSAs are resolved per job by `msa_pairing` (see _Inference: precomputed vs species pairing_); `JobInput.msa_pairing` records the result
 - `ProteinChainInput`: `sequence`, `count`, `paired_msa: MSA | None`, `unpaired_msa: MSA | None`, `template_hits: list[TemplateHitInput]`
 - `NucleotideChainInput`: `sequence`, `count`, `mol_type: int`, `paired_msa: MSA | None`, `unpaired_msa: MSA | None`
 - `TemplateHitInput` (in `templates.py`): `mmcif_text`, `query_indices | hhr_hit` — holds parsed template data ready for feature extraction

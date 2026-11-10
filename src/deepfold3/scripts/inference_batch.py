@@ -45,6 +45,7 @@ from pathlib import Path
 import click
 import torch
 
+from deepfold3.data.msa.pairing import MSA_PAIRING_MODES
 from deepfold3.io.run_manifest import checkpoint_record, gpu_name, new_manifest, sha256_file, write_manifest
 from deepfold3.model import kernel_census
 from deepfold3.model.config import OPTIM_PRESETS
@@ -153,6 +154,7 @@ def _run_one_job(
     template_cache: Path | None,
     pdb_mmcif_dir: Path | None,
     plot_confidences: bool,
+    msa_pairing: str = "auto",
     save_distogram: bool = False,
     logits_scheme: str = "int8_softmax",
     skip_existing: bool,
@@ -189,7 +191,9 @@ def _run_one_job(
 
     click.echo(f"[batch] featurizing {json_input} …")
     t0 = time.perf_counter()
-    jobs = parse_json_input(json_input, template_cache_dir=template_cache, pdb_mmcif_dir=pdb_mmcif_dir)
+    jobs = parse_json_input(
+        json_input, template_cache_dir=template_cache, pdb_mmcif_dir=pdb_mmcif_dir, msa_pairing=msa_pairing
+    )
     if not jobs:
         click.echo(f"[batch] skipping {json_input}: no jobs in JSON")
         return
@@ -291,6 +295,7 @@ def _run_one_job(
         num_tokens=original_n,
         padded_tokens=feats["res_type"].shape[0],
         msa_rows=S,
+        msa_pairing={"requested": msa_pairing, "resolved": job.msa_pairing},
         guidance=[{**dataclasses.asdict(g), "description": _describe_guidance(g)} for g in guidance_specs],
         restraints=[
             {**dataclasses.asdict(r), "description": describe_restraint(r), "weight": restraint_weight}
@@ -496,6 +501,13 @@ def _parse_inputs_file(path: Path, output_template: str, params: Path) -> list[t
 @click.option("--template-cache", default=None, type=click.Path(path_type=Path))
 @click.option("--pdb-mmcif-dir", default=None, type=click.Path(exists=True, path_type=Path))
 @click.option(
+    "--msa-pairing",
+    default="auto",
+    type=click.Choice(MSA_PAIRING_MODES),
+    show_default=True,
+    help="How each chain's pairedMsa is used (JSON input). precomputed: rows are already paired across chains (row i of every chain is one paired row; ColabFold/MMseqs2 pairaln output). species: pairedMsa is each chain's raw UniProt hits (AF3 semantics); rows are paired by species as AF3/OpenFold3 do, and unpaired rows repeating a paired row are dropped. auto: species only when >=2 distinct protein chains have paired MSAs whose headers carry UniProt species ids and whose row counts differ, else precomputed.",
+)
+@click.option(
     "--optim",
     default="inference",
     type=click.Choice(OPTIM_PRESETS),
@@ -680,6 +692,7 @@ def inference_batch(
     device: str | None,
     template_cache: Path | None,
     pdb_mmcif_dir: Path | None,
+    msa_pairing: str,
     optim: str,
     matmul_precision: str,
     precision: str,
@@ -806,6 +819,7 @@ def inference_batch(
             seeds=seed_list,
             template_cache=template_cache,
             pdb_mmcif_dir=pdb_mmcif_dir,
+            msa_pairing=msa_pairing,
             plot_confidences=plot_confidences,
             save_distogram=save_distogram,
             logits_scheme=logits_scheme,
