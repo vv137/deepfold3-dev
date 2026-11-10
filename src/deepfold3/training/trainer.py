@@ -46,12 +46,13 @@ from deepfold3.training.optim import (
     WrappedOptimizer,
     build_optimizer,
     freeze_for_confidence,
+    freeze_modules,
     is_chunked_diffusion_active,
     register_reduce_hook,
     wrap_ddp,
 )
 from deepfold3.training.rank_zero import rank_zero_info, rank_zero_warn
-from deepfold3.training.scheduler import AF3LRScheduler, build_scheduler
+from deepfold3.training.scheduler import AF3LRScheduler, WSDSScheduler, build_scheduler
 from deepfold3.training.signals import CheckpointRequestHandler, ShutdownCoordinator
 from deepfold3.training.state import TrainState, seed_everything
 from deepfold3.training.step import scaled_backward, training_step
@@ -76,9 +77,24 @@ _SCHEDULER_CFG_FIELDS: tuple[tuple[str, str], ...] = (
     ("start_decay_after", "start_decay_after"),
     ("decay_every", "decay_every"),
     ("decay_factor", "decay_factor"),
-    ("max_steps", "cosine_max_steps"),
-    ("min_ratio", "cosine_min_lr_ratio"),
+    ("max_steps", "effective_finetune_max_steps"),
+    ("min_ratio", "effective_finetune_min_lr_ratio"),
+    ("decay_start", "finetune_decay_start"),
+    ("shape", "finetune_scheduler"),
 )
+
+
+def _scheduler_cfg_fields(scheduler) -> tuple[tuple[str, str], ...]:
+    """``_SCHEDULER_CFG_FIELDS`` for this scheduler's class.
+
+    ``WSDSScheduler.min_ratio`` is ``wsds_min_lr_ratio``, not the cosine field
+    of the same attribute name.
+    """
+    if isinstance(scheduler, WSDSScheduler):
+        return tuple(
+            (a, "wsds_min_lr_ratio" if a == "min_ratio" else c) for a, c in _SCHEDULER_CFG_FIELDS if a != "shape"
+        )
+    return _SCHEDULER_CFG_FIELDS
 
 
 def _yaml_safe(value):
@@ -206,8 +222,12 @@ class Trainer:
             self._load_pretrained(self.cfg.params_path)
 
         # Freeze parameters for confidence-only training (stage 3)
+        if self.cfg.train_confidence_only and self.cfg.freeze_modules:
+            raise ValueError("train_confidence_only and freeze_modules are exclusive; set one")
         if self.cfg.train_confidence_only:
             freeze_for_confidence(self.model)
+        if self.cfg.freeze_modules:
+            freeze_modules(self.model, self.cfg.freeze_modules)
 
         self.ddp_model, use_static_graph = wrap_ddp(self.model, self.dist, self.cfg)
         self._install_precision_policy()
@@ -628,7 +648,7 @@ class Trainer:
         # in the constructor — so the audit below still reports it as shadowed.
         if resumed and self.scheduler is not None:
             sched_overrides: list[str] = []
-            for sched_attr, cfg_attr in _SCHEDULER_CFG_FIELDS:
+            for sched_attr, cfg_attr in _scheduler_cfg_fields(self.scheduler):
                 if not hasattr(self.scheduler, sched_attr) or not hasattr(self.cfg, cfg_attr):
                     continue
                 saved_val = getattr(self.scheduler, sched_attr)
@@ -703,7 +723,7 @@ class Trainer:
             # kept the saved value.
             sched = self.scheduler
             sched_pairs: list[tuple[str, str]] = []
-            for sched_attr, cfg_attr in _SCHEDULER_CFG_FIELDS:
+            for sched_attr, cfg_attr in _scheduler_cfg_fields(sched):
                 if hasattr(sched, sched_attr) and hasattr(self.cfg, cfg_attr):
                     sched_pairs.append((sched_attr, cfg_attr))
             for sched_attr, cfg_attr in sched_pairs:

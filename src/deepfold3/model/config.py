@@ -1475,9 +1475,20 @@ class TrainingConfig:
 
     # Multi-stage training (use --override or JSON config to set these per stage)
     train_confidence_only: bool = False  # freeze trunk, only train confidence head
-    finetune_scheduler: str = "af3"  # "af3", "cosine", or "wsds"
-    cosine_min_lr_ratio: float = 0.1  # min LR = lr * ratio (for cosine scheduler)
-    cosine_max_steps: int = 20000  # total steps for cosine annealing
+    # Top-level DeepFold3 submodules to freeze (requires_grad=False), e.g.
+    # ["evo_cond_encoder", "evoformer"] to train the diffusion head on a fixed
+    # trunk. Frozen parameters get no optimizer state and no EMA shadow.
+    freeze_modules: list[str] = field(default_factory=list)
+    # "af3", "wsds", or warmup -> [constant] -> decay with decay shape "cosine",
+    # "linear" or "1-sqrt"; the last three read the finetune_* fields below.
+    finetune_scheduler: str = "af3"
+    finetune_decay_start: int = 0  # decay begins at max(warmup_steps, this); LR is constant in between
+    finetune_max_steps: int | None = None  # step at which the decay reaches the floor (default 20000)
+    finetune_min_lr_ratio: float | None = None  # floor: lr * ratio (default 0.1)
+    # Deprecated spellings of finetune_max_steps / finetune_min_lr_ratio, still
+    # read when the new name is unset (older configs and pickled train_cfg).
+    cosine_min_lr_ratio: float = 0.1
+    cosine_max_steps: int = 20000
 
     # Warmup-Stable-Decay-Simplified (WSD-S) — continual-pretraining schedule
     # with multiple [decay_start, decay_end] checkpoints. After warmup the LR
@@ -1547,6 +1558,18 @@ class TrainingConfig:
         # ``_backfill_dataclass``.
         self.__dict__.update(state)
         _backfill_dataclass(self, TrainingConfig())
+
+    # Resolved at read time, not in __post_init__: scripts/train.py builds a
+    # default TrainingConfig and then setattr()s the yaml keys onto it.
+    @property
+    def effective_finetune_max_steps(self) -> int:
+        """``finetune_max_steps``, else its deprecated spelling ``cosine_max_steps``."""
+        return self.cosine_max_steps if self.finetune_max_steps is None else self.finetune_max_steps
+
+    @property
+    def effective_finetune_min_lr_ratio(self) -> float:
+        """``finetune_min_lr_ratio``, else its deprecated spelling ``cosine_min_lr_ratio``."""
+        return self.cosine_min_lr_ratio if self.finetune_min_lr_ratio is None else self.finetune_min_lr_ratio
 
     def __post_init__(self):
         """Validate configuration values."""

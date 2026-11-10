@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 import torch.nn as nn
@@ -9,7 +11,7 @@ import torch.nn as nn
 from deepfold3.model.config import TrainingConfig
 from deepfold3.training.distributed import DistInfo
 from deepfold3.training.ema import EMA
-from deepfold3.training.scheduler import AF3LRScheduler, WSDSScheduler, build_scheduler
+from deepfold3.training.scheduler import AF3LRScheduler, CosineAnnealingScheduler, WSDSScheduler, build_scheduler
 from deepfold3.training.signals import ShutdownCoordinator
 
 
@@ -1371,3 +1373,168 @@ class TestShutdownStopFile:
     def test_unset_is_inert(self, monkeypatch):
         monkeypatch.delenv("DF3_STOP_FILE", raising=False)
         assert ShutdownCoordinator(self._dist()).tick() is False
+
+
+# ---------------------------------------------------------------------------
+# Warmup -> stable -> decay shapes (cosine / linear / 1-sqrt)
+# ---------------------------------------------------------------------------
+
+
+class TestDecayShapes:
+    def _lam(self, shape, *, warmup=10, decay_start=0, max_steps=110, min_ratio=0.0):
+        optimizer = torch.optim.Adam(_simple_model().parameters(), lr=1e-3)
+        cfg = TrainingConfig(
+            lr=1e-3,
+            finetune_scheduler=shape,
+            warmup_steps=warmup,
+            finetune_decay_start=decay_start,
+            finetune_max_steps=max_steps,
+            finetune_min_lr_ratio=min_ratio,
+        )
+        sched = build_scheduler(optimizer, cfg)
+        assert isinstance(sched, CosineAnnealingScheduler)
+        return sched.lr_lambdas[0]
+
+    @pytest.mark.parametrize("shape,mid", [("cosine", 0.5), ("linear", 0.5), ("1-sqrt", 1.0 - 0.5**0.5)])
+    def test_endpoints_and_midpoint(self, shape, mid):
+        lam = self._lam(shape)
+        assert lam(5) == pytest.approx(0.5)  # warmup
+        assert lam(10) == pytest.approx(1.0)  # decay starts at the end of warmup
+        assert lam(60) == pytest.approx(mid)  # half way through [10, 110]
+        assert lam(110) == pytest.approx(0.0)
+        assert lam(500) == pytest.approx(0.0)  # held at the floor
+
+    def test_min_ratio_floor(self):
+        lam = self._lam("linear", min_ratio=0.1)
+        assert lam(60) == pytest.approx(0.1 + 0.9 * 0.5)
+        assert lam(110) == pytest.approx(0.1)
+
+    def test_stable_phase(self):
+        lam = self._lam("1-sqrt", warmup=10, decay_start=60, max_steps=110)
+        assert lam(10) == pytest.approx(1.0)
+        assert lam(59) == pytest.approx(1.0)
+        assert lam(60) == pytest.approx(1.0)
+        assert lam(85) == pytest.approx(1.0 - 0.5**0.5)
+        assert lam(110) == pytest.approx(0.0)
+
+    def test_cosine_default_unchanged(self):
+        # finetune_decay_start=0 keeps the old warmup -> cosine schedule.
+        lam = self._lam("cosine", warmup=10, max_steps=110, min_ratio=0.1)
+        assert lam(35) == pytest.approx(0.1 + 0.9 * (1 + math.cos(math.pi * 0.25)) / 2)
+
+    def test_end_before_start_rejected(self):
+        with pytest.raises(ValueError, match="finetune_max_steps"):
+            self._lam("linear", warmup=10, decay_start=200, max_steps=110)
+
+    def test_resume_override_switches_shape(self):
+        from deepfold3.training.trainer import _scheduler_cfg_fields
+
+        optimizer = torch.optim.Adam(_simple_model().parameters(), lr=1e-3)
+        saved = build_scheduler(
+            optimizer,
+            TrainingConfig(
+                lr=1e-3, warmup_steps=10, start_decay_after=10, finetune_scheduler="cosine", finetune_max_steps=110
+            ),
+        )
+        cfg = TrainingConfig(
+            lr=1e-3,
+            warmup_steps=10,
+            start_decay_after=10,
+            finetune_scheduler="linear",
+            finetune_max_steps=110,
+            finetune_decay_start=50,
+        )
+        sched = build_scheduler(optimizer, cfg)
+        sched.load_state_dict(saved.state_dict())
+        assert sched.shape == "cosine"  # the checkpoint shadows the yaml
+        for a, c in _scheduler_cfg_fields(sched):
+            if hasattr(sched, a):
+                setattr(sched, a, getattr(cfg, c))
+        assert (sched.shape, sched.decay_start) == ("linear", 50)
+
+    def test_wsds_min_ratio_maps_to_its_own_field(self):
+        from deepfold3.training.trainer import _scheduler_cfg_fields
+
+        optimizer = torch.optim.Adam(_simple_model().parameters(), lr=1e-3)
+        cfg = TrainingConfig(
+            lr=1e-3, finetune_scheduler="wsds", wsds_decay_windows=[[100, 110]], wsds_min_lr_ratio=0.01
+        )
+        fields = dict(_scheduler_cfg_fields(build_scheduler(optimizer, cfg)))
+        assert fields["min_ratio"] == "wsds_min_lr_ratio"
+        assert "shape" not in fields
+
+
+# ---------------------------------------------------------------------------
+# freeze_modules
+# ---------------------------------------------------------------------------
+
+
+class TestFreezeModules:
+    def _model(self):
+        torch.manual_seed(0)
+        m = nn.Module()
+        m.trunk = nn.Linear(4, 4)
+        m.head = nn.Linear(4, 2)
+        return m
+
+    def test_freezes_named_children_only(self):
+        from deepfold3.training.optim import build_optimizer, freeze_modules
+
+        m = self._model()
+        freeze_modules(m, ["trunk"])
+        assert not any(p.requires_grad for p in m.trunk.parameters())
+        assert all(p.requires_grad for p in m.head.parameters())
+        # No EMA shadow and no optimizer slot for frozen parameters.
+        assert set(EMA(m).shadow) == {"head.weight", "head.bias"}
+        opt = build_optimizer(m, TrainingConfig(lr=1e-3))
+        n_opt = sum(p.numel() for g in opt.param_groups for p in g["params"])
+        assert n_opt == sum(p.numel() for p in m.head.parameters())
+
+    def test_frozen_trunk_gets_no_grad(self):
+        from deepfold3.training.optim import freeze_modules
+
+        m = self._model()
+        freeze_modules(m, ["trunk"])
+        m.head(m.trunk(torch.randn(3, 4))).sum().backward()
+        assert all(p.grad is None for p in m.trunk.parameters())
+        assert all(p.grad is not None for p in m.head.parameters())
+
+    def test_unknown_name_rejected(self):
+        from deepfold3.training.optim import freeze_modules
+
+        with pytest.raises(ValueError, match="no top-level module"):
+            freeze_modules(self._model(), ["pairformer"])
+
+    def test_stage2_frozen_trunk_names_exist(self):
+        from deepfold3.config_loader import resolve_config
+        from deepfold3.model.model import DeepFold3
+
+        names = resolve_config("configs/stage2-frozen-trunk.yaml")["training"]["freeze_modules"]
+        assert names == ["evo_cond_encoder", "evoformer"]
+        # Building DeepFold3 on CPU is slow; the names must be assigned in __init__.
+        import inspect
+
+        src = inspect.getsource(DeepFold3.__init__)
+        for n in names:
+            assert f"self.{n} = " in src
+
+
+def test_cosine_spellings_still_read():
+    """Configs and pickled train_cfg written before the finetune_* names."""
+    import pickle
+
+    # scripts/train.py: default config first, yaml keys setattr()'d afterwards.
+    cfg = TrainingConfig()
+    cfg.cosine_max_steps, cfg.cosine_min_lr_ratio = 5000, 0.0
+    assert (cfg.effective_finetune_max_steps, cfg.effective_finetune_min_lr_ratio) == (5000, 0.0)
+    cfg.finetune_max_steps = 7000
+    assert cfg.effective_finetune_max_steps == 7000  # the new name wins
+
+    old = TrainingConfig(cosine_max_steps=3000)
+    state = dict(old.__dict__)
+    for k in ("finetune_max_steps", "finetune_min_lr_ratio", "finetune_decay_start"):
+        state.pop(k)
+    restored = TrainingConfig.__new__(TrainingConfig)
+    restored.__setstate__(state)
+    assert (restored.effective_finetune_max_steps, restored.finetune_decay_start) == (3000, 0)
+    assert pickle.loads(pickle.dumps(restored)).effective_finetune_max_steps == 3000

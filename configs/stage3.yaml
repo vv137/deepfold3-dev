@@ -1,0 +1,47 @@
+base: stage2.yaml
+
+# Stage 3 — stage2 at a 640-token crop, then a short LR decay.
+#
+# Starts from a stage2 checkpoint's EMA weights with a fresh optimizer and step
+# counter, so it warms up again:
+#   deepfold3 export --checkpoint .../df3-stage2-001/checkpoint_50000.pt \
+#       --output .../stage2-50000-shadow.safetensors --snapshot shadow
+#   --params .../stage2-50000-shadow.safetensors
+# `--params` reads ckpt["model"] (the live weights) from a .pt, so export the
+# shadow first: the stage2 benchmarks all evaluated the shadow.
+#
+# Conditioning dropout stays on (inherited from stage2), so the checkpoint keeps
+# classifier-free guidance.
+#
+# LR: 1k warmup, constant until finetune_decay_start, then decay to
+# lr * finetune_min_lr_ratio at finetune_max_steps (= max_steps). The defaults here
+# are the plan as asked (no constant phase, linear to 0); set the stable length,
+# shape and floor before launch.
+
+training:
+  wandb_project: deepfold3-stage3
+
+  # df3-stage2-001 ran with --grad-accum 1 over stage1.yaml's 2; state it here.
+  accumulate_grad_batches: 1
+
+  max_tokens: 640
+  # stage2's 13.5 atoms per token (6912 / 512) at 640 tokens.
+  max_atoms: 8640
+
+  # Same 32 noise levels per crop as stage2, so the per-step gradient noise of
+  # the diffusion loss is unchanged. Chunking splits the backward only (same
+  # gradients); halve it to 2 if the 640 smoke test runs out of memory.
+  diffusion_batch_size: 32
+  diffusion_chunk_size: 4
+
+  lr: 0.9e-3
+  warmup_steps: 1000
+  finetune_scheduler: linear  # cosine | linear | 1-sqrt
+  finetune_decay_start: 1000
+  finetune_max_steps: 5000
+  finetune_min_lr_ratio: 0.0
+  max_steps: 5000
+
+  skip_load_optimizer: true
+  skip_load_scheduler: true
+  skip_load_step: true

@@ -127,6 +127,23 @@ def freeze_for_confidence(model: nn.Module) -> None:
     rank_zero_info(f"Confidence-only training: {trainable / 1e6:.1f}M trainable parameters")
 
 
+def freeze_modules(model: nn.Module, names: list[str]) -> None:
+    """Freeze the named top-level submodules (e.g. ``evoformer``) of ``model``.
+
+    Raises:
+        ValueError: if a name is not a direct child module of ``model``.
+    """
+    children = dict(model.named_children())
+    unknown = [n for n in names if n not in children]
+    if unknown:
+        raise ValueError(f"freeze_modules: no top-level module {unknown}; have {sorted(children)}")
+    for n in names:
+        children[n].requires_grad_(False)
+    frozen = sum(p.numel() for n in names for p in children[n].parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    rank_zero_info(f"Frozen {names}: {frozen / 1e6:.1f}M params frozen, {trainable / 1e6:.1f}M trainable")
+
+
 # Parameter-name substrings that mark a weight as "gate" or "embedding" — both
 # excluded from weight decay alongside LN/bias (1D) params. Substring match on
 # the qualified parameter name (so ``ModuleList`` indices like

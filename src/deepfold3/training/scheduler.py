@@ -71,22 +71,44 @@ class AF3LRScheduler(LambdaLR):
         return self.decay_factor**n_decays
 
 
+#: Decay shapes of :class:`CosineAnnealingScheduler`, as ``progress -> factor``
+#: on ``[0, 1] -> [1, 0]``. ``1-sqrt`` is the cooldown Hägele et al. 2024
+#: (arXiv:2405.18392) found best for warmup-stable-decay runs.
+DECAY_SHAPES = {
+    "cosine": lambda p: (1.0 + math.cos(math.pi * p)) / 2.0,
+    "linear": lambda p: 1.0 - p,
+    "1-sqrt": lambda p: 1.0 - math.sqrt(p),
+}
+
+
 class CosineAnnealingScheduler(LambdaLR):
-    """Cosine annealing with linear warmup for fine-tuning.
+    """Linear warmup, optional constant phase, then a decay to ``min_ratio``.
 
     1. **Warmup** (steps ``[0, warmup_steps)``): linear ramp ``0 -> max_lr``.
-    2. **Cosine decay** (steps ``[warmup_steps, max_steps]``):
-       ``max_lr * (min_ratio + (1 - min_ratio) * (1 + cos(pi * progress)) / 2)``.
+    2. **Stable** (steps ``[warmup_steps, decay_start)``): constant ``max_lr``.
+       Empty when ``finetune_decay_start <= warmup_steps`` (the default 0).
+    3. **Decay** (steps ``[decay_start, max_steps]``):
+       ``max_lr * (min_ratio + (1 - min_ratio) * shape(progress))``, held at
+       ``min_ratio`` after ``max_steps``. ``shape`` is ``finetune_scheduler``:
+       ``cosine``, ``linear`` or ``1-sqrt`` (see :data:`DECAY_SHAPES`).
 
     Args:
         optimizer: Optimizer to schedule.
-        cfg: Training config with cosine schedule parameters.
+        cfg: Training config — reads ``warmup_steps``, ``finetune_decay_start``,
+            ``finetune_max_steps``, ``finetune_min_lr_ratio``, ``finetune_scheduler``.
     """
 
     def __init__(self, optimizer: Optimizer, cfg: TrainingConfig):
+        self.shape = cfg.finetune_scheduler if cfg.finetune_scheduler in DECAY_SHAPES else "cosine"
         self.warmup_steps = cfg.warmup_steps
-        self.max_steps = cfg.cosine_max_steps
-        self.min_ratio = cfg.cosine_min_lr_ratio
+        self.decay_start = cfg.finetune_decay_start
+        self.max_steps = cfg.effective_finetune_max_steps
+        self.min_ratio = cfg.effective_finetune_min_lr_ratio
+        start = max(self.warmup_steps, self.decay_start)
+        if self.max_steps <= start:
+            raise ValueError(f"finetune_max_steps ({self.max_steps}) must be > the decay start ({start})")
+        if not 0.0 <= self.min_ratio <= 1.0:
+            raise ValueError(f"finetune_min_lr_ratio must be in [0, 1], got {self.min_ratio}")
 
         super().__init__(optimizer, self._lr_lambda)
 
@@ -94,8 +116,9 @@ class CosineAnnealingScheduler(LambdaLR):
         if step < self.warmup_steps:
             return step / max(1, self.warmup_steps)
 
-        progress = min(1.0, (step - self.warmup_steps) / max(1, self.max_steps - self.warmup_steps))
-        return self.min_ratio + (1.0 - self.min_ratio) * (1.0 + math.cos(math.pi * progress)) / 2.0
+        start = max(self.warmup_steps, self.decay_start)
+        progress = min(1.0, max(0.0, (step - start) / max(1, self.max_steps - start)))
+        return self.min_ratio + (1.0 - self.min_ratio) * DECAY_SHAPES[self.shape](progress)
 
 
 class WSDSScheduler(LambdaLR):
@@ -173,10 +196,10 @@ def build_scheduler(optimizer: Optimizer, cfg: TrainingConfig) -> LambdaLR:
         return LambdaLR(optimizer, lr_lambda=lambda step: 1.0)
 
     name = cfg.finetune_scheduler
-    if name == "cosine":
+    if name in DECAY_SHAPES:
         return CosineAnnealingScheduler(optimizer, cfg)
     if name == "wsds":
         return WSDSScheduler(optimizer, cfg)
     if name == "af3":
         return AF3LRScheduler(optimizer, cfg)
-    raise ValueError(f"finetune_scheduler must be 'af3', 'cosine', or 'wsds'; got {name!r}")
+    raise ValueError(f"finetune_scheduler must be 'af3', 'cosine', 'linear', '1-sqrt' or 'wsds'; got {name!r}")
