@@ -27,10 +27,10 @@ training:
   max_atoms: 8640
 
   # 48 noise levels per crop (AF3's value; stage1/2 used 32). Chunking splits
-  # the backward only (same gradients); chunk 2 did not fix the 640 OOM, which
-  # was in the confidence head.
+  # the backward only (same gradients). Chunk 4 peaked at 92.1 GiB of 95 on a
+  # GH200 (smoke 1252279), so 2 for headroom.
   diffusion_batch_size: 48
-  diffusion_chunk_size: 4
+  diffusion_chunk_size: 2
 
   lr: 0.9e-3
   warmup_steps: 1000

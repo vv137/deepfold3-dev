@@ -33,9 +33,12 @@ Dense atom indices (from deepfold3.data.const):
 
 from __future__ import annotations
 
+from functools import partial
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 
 from deepfold3.model.attention import GridSelfAttention
 from deepfold3.model.config import OptimConfig, TemplateEmbeddingConfig
@@ -44,6 +47,8 @@ from deepfold3.model.ops import TriangleMulIncoming, TriangleMulOutgoing
 from deepfold3.model.optim import make_transition_block
 from deepfold3.model.primitives import LayerNorm, LinearNoBias, block_residual_scale
 from deepfold3.model.triton.dropout_add import dropout_add_columnwise, dropout_add_rowwise
+
+_checkpoint = partial(_torch_checkpoint, use_reentrant=False, determinism_check="none")
 
 # Dense atom indices for backbone atoms
 _CA_IDX = 1
@@ -253,6 +258,8 @@ class SingleTemplateEmbedding(nn.Module):
         super().__init__()
         c = cfg.num_channels
         pc = cfg.pair_channel
+        # Per-block activation checkpointing, as the trunk stacks do.
+        self._grad_checkpoint = bool(optim and optim.use_gradient_checkpointing)
 
         # 9 input feature projections (AF3: template_pair_embedding_* uses initializer='relu')
         self.embed_dgram = LinearNoBias(cfg.dgram_num_bins, c, initializer="relu")
@@ -398,8 +405,9 @@ class SingleTemplateEmbedding(nn.Module):
 
         # Template PairFormer stack (TemplatePairFormerBlock uses the same
         # batched primitives as the trunk).
+        use_ckpt = self._grad_checkpoint and torch.is_grad_enabled()
         for layer in self.pairformer:
-            act = layer(act, pair_mask)
+            act = _checkpoint(layer, act, pair_mask) if use_ckpt else layer(act, pair_mask)
 
         # Output normalization
         act = self.output_norm(act)

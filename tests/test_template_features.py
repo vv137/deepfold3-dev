@@ -360,3 +360,42 @@ class TestTemplateIndexSpaceResolution:
             ds._indices_are_struct("struct")
             ds._indices_are_struct("seqres")
         assert not [r for r in caplog.records if "index_space" in r.getMessage()]
+
+
+def test_template_pairformer_checkpoint_matches_and_recomputes_per_block():
+    """Per-block checkpointing changes memory, not outputs or gradients."""
+    import copy
+
+    import torch
+
+    plain = wake_zero_init(_template_embedding()).train()
+    ckpt = copy.deepcopy(plain)
+    ckpt.single_template_emb._grad_checkpoint = True
+    n_tokens = 8
+    c_pair = plain.single_template_emb.query_norm.normalized_shape[0]
+
+    def run(mod):
+        gen = torch.Generator().manual_seed(3)
+        slots = _template_slots(2, n_tokens, gen)
+        query_pair = torch.randn(n_tokens, n_tokens, c_pair, dtype=torch.float64, generator=gen, requires_grad=True)
+        calls = []
+        for layer in mod.single_template_emb.pairformer:
+            fwd = layer.forward
+
+            def counted(*a, _fwd=fwd, **k):
+                calls.append(1)
+                return _fwd(*a, **k)
+
+            layer.forward = counted
+        torch.manual_seed(4)  # same dropout masks in both runs
+        out = mod(query_pair=query_pair, pair_mask=torch.ones(n_tokens, n_tokens, dtype=torch.float64), **slots)
+        out.pow(2).mean().backward()
+        return out, [p.grad for p in mod.parameters() if p.grad is not None] + [query_pair.grad], len(calls)
+
+    out_a, grads_a, calls_a = run(plain)
+    out_b, grads_b, calls_b = run(ckpt)
+    torch.testing.assert_close(out_b, out_a)
+    for a, b in zip(grads_a, grads_b, strict=True):
+        torch.testing.assert_close(b, a)
+    blocks = len(plain.single_template_emb.pairformer) * 2  # two templates
+    assert (calls_a, calls_b) == (blocks, 2 * blocks)
