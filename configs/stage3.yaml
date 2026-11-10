@@ -13,10 +13,10 @@ base: stage2.yaml
 # Conditioning dropout stays on (inherited from stage2), so the checkpoint keeps
 # classifier-free guidance.
 #
-# LR: 1k warmup, constant until finetune_decay_start, then decay to
-# lr * finetune_min_lr_ratio at finetune_max_steps (= max_steps). The defaults here
-# are the plan as asked (no constant phase, linear to 0); set the stable length,
-# shape and floor before launch.
+# LR: 1k linear warmup, then a 4k cosine decay to 0 at step 5000. The cosine
+# keeps lr above half its peak for the first 2k decay steps, which is the time
+# the 640 crop gets at high lr. For an explicit constant phase instead
+# (1k + 2k + 2k), set finetune_decay_start: 3000.
 
 training:
   wandb_project: deepfold3-stage3
@@ -36,7 +36,7 @@ training:
 
   lr: 0.9e-3
   warmup_steps: 1000
-  finetune_scheduler: linear  # cosine | linear | 1-sqrt
+  finetune_scheduler: cosine  # cosine | linear | 1-sqrt
   finetune_decay_start: 1000
   finetune_max_steps: 5000
   finetune_min_lr_ratio: 0.0
