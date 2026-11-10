@@ -27,10 +27,12 @@ training:
   max_atoms: 8640
 
   # 48 noise levels per crop (AF3's value; stage1/2 used 32). Chunking splits
-  # the backward only (same gradients). Chunk 4 peaked at 92.1 GiB of 95 on a
-  # GH200 (smoke 1252279), so 2 for headroom.
+  # the backward only (same gradients). Without template checkpointing, chunk 4
+  # peaked at 92.1 GiB of 95 on a GH200 (smoke 1252279); with it and chunk 2 the
+  # peak was 47.0 GiB (smoke 1252460), so chunk 4 again for speed (24.5 vs 34 s
+  # per step). df3-stage3-001 was launched with --override diffusion_chunk_size=4.
   diffusion_batch_size: 48
-  diffusion_chunk_size: 2
+  diffusion_chunk_size: 4
 
   lr: 0.9e-3
   warmup_steps: 1000

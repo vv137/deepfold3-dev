@@ -1510,7 +1510,7 @@ class TestFreezeModules:
         from deepfold3.model.model import DeepFold3
 
         names = resolve_config("configs/stage2-frozen-trunk.yaml")["training"]["freeze_modules"]
-        assert names == ["evo_cond_encoder", "evoformer"]
+        assert names == ["evo_cond_encoder", "evoformer", "confidence_head"]
         # Building DeepFold3 on CPU is slow; the names must be assigned in __init__.
         import inspect
 

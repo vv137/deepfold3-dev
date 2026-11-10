@@ -1,15 +1,17 @@
 base: stage2.yaml
 
-# Stage 2 with the trunk frozen: only the diffusion head (and the distogram
-# head, which reads the frozen pair and so moves nothing upstream) trains under
-# stage2's conditioning dropout.
+# Stage 2 with the trunk and the confidence head frozen: only the diffusion
+# head (and the distogram head, which reads the frozen pair and so moves nothing
+# upstream) trains under stage2's conditioning dropout.
 #
-# Frozen: evo_cond_encoder (ref-atom -> token features) and evoformer
-# (templates, MSA stack, pairformer). No trunk parameter requires grad and no
-# trunk input does, so the trunk should build no autograd graph and lose its
-# activation memory and backward cost; not yet measured. The EMA shadow covers only the trainable
-# parameters; `--snapshot shadow` overlays it onto the saved weights, which
-# carry the frozen trunk unchanged.
+# Frozen: evo_cond_encoder (ref-atom -> token features), evoformer (templates,
+# MSA stack, pairformer) and confidence_head. No trunk parameter requires grad
+# and no trunk input does, so the trunk should build no autograd graph and lose
+# its activation memory and backward cost; not yet measured. alpha_confidence 0
+# skips the confidence forward entirely (model.py gates it on alpha > 0), so a
+# frozen head costs nothing; the mini-rollout still runs for chain permutation.
+# The EMA shadow covers only the trainable parameters; `--snapshot shadow`
+# overlays it onto the saved weights, which carry the frozen modules unchanged.
 #
 # Pass the starting weights with --params. Fresh optimizer and step counter,
 # so warmup_steps applies again.
@@ -20,7 +22,8 @@ training:
   # df3-stage2-001 ran with --grad-accum 1 over stage1.yaml's 2.
   accumulate_grad_batches: 1
 
-  freeze_modules: [evo_cond_encoder, evoformer]
+  freeze_modules: [evo_cond_encoder, evoformer, confidence_head]
+  alpha_confidence: 0.0
 
   skip_load_optimizer: true
   skip_load_scheduler: true
