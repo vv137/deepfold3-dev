@@ -1027,6 +1027,17 @@ def resolve_msa_pairing_mode(job: JobInput, mode: str) -> tuple[str, str]:
     return "species", "raw UniProt hits with per-chain row counts"
 
 
+def describe_msa_pairing(job: JobInput) -> str:
+    """One-line summary of the resolved pairing, for CLI output.
+
+    Returns:
+        E.g. ``"species; paired rows per protein chain [8192, 8192, 8192]"``
+        (row counts include the query row; 0 = no paired MSA).
+    """
+    depths = [c.paired_msa.sequences.shape[0] if c.paired_msa is not None else 0 for c in job.protein_chains]
+    return f"{job.msa_pairing}; paired rows per protein chain {depths}"
+
+
 def _paired_reps(job: JobInput) -> dict[str, ProteinChainInput]:
     """One protein chain per distinct sequence whose paired MSA has hits beyond the query."""
     reps: dict[str, ProteinChainInput] = {}

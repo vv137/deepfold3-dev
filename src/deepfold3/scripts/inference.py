@@ -593,7 +593,7 @@ def inference(
     chain_names: list[str | None] | None = None
     if json_input is not None:
         click.echo(f"[inference] featurizing {json_input} …")
-        from deepfold3.data.parse.json_input import parse_json_input
+        from deepfold3.data.parse.json_input import describe_msa_pairing, parse_json_input
 
         jobs = parse_json_input(
             json_input, template_cache_dir=template_cache, pdb_mmcif_dir=pdb_mmcif_dir, msa_pairing=msa_pairing
@@ -603,7 +603,7 @@ def inference(
         job = jobs[0]
         job_name = job.name
         msa_pairing_used = job.msa_pairing
-        click.echo(f"[inference] MSA pairing: {msa_pairing_used} (--msa-pairing {msa_pairing})")
+        click.echo(f"[inference] MSA pairing: {describe_msa_pairing(job)} (--msa-pairing {msa_pairing})")
         job_title = job.description or job.name
 
         # Chain names as written in the input JSON, in asym_id order. Without

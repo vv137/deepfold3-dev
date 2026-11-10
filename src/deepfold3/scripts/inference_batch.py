@@ -180,7 +180,7 @@ def _run_one_job(
     ``skip_existing`` is set, any seed whose full set of sample CIFs already
     exists is skipped (per-seed resume)."""
     from deepfold3.data.module.dataset import InferenceInput
-    from deepfold3.data.parse.json_input import parse_json_input
+    from deepfold3.data.parse.json_input import describe_msa_pairing, parse_json_input
     from deepfold3.io.confidences import (
         save_confidences_json,
         save_distogram_logits,
@@ -199,6 +199,7 @@ def _run_one_job(
         return
     job = jobs[0]
     job_name = job.name
+    click.echo(f"[batch] MSA pairing: {describe_msa_pairing(job)} (--msa-pairing {msa_pairing})")
     job_title = job.description or job.name
 
     # Chain names as written in the input JSON, in asym_id order — otherwise the

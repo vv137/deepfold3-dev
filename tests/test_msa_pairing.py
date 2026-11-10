@@ -240,6 +240,9 @@ def test_auto_selects_species_for_raw_uniprot_hits(tmp_path):
     depths = [c.paired_msa.sequences.shape[0] for c in job.protein_chains]
     assert depths == [3, 3]
     assert all(c.paired_msa_species is None for c in job.protein_chains)
+    from deepfold3.data.parse.json_input import describe_msa_pairing
+
+    assert describe_msa_pairing(job) == "species; paired rows per protein chain [3, 3]"
 
 
 def _colabfold_paired(query: str, n: int, offset: int) -> str:
