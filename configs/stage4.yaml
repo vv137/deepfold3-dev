@@ -26,8 +26,8 @@ training:
 model:
   data:
     # Chains kept per crop (stage0-3: 20) and the record-level filter on total
-    # chains (stage0-3: 30). Raised for the larger crop.
-    max_chains: 30
+    # chains (stage0-3: 30). Raised for the larger crop; equal, so no record is filtered for having more chains than a crop may keep.
+    max_chains: 50
     max_total_chains: 50
 
 datasets:
