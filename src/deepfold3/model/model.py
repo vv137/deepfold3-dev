@@ -500,6 +500,7 @@ class DeepFold3(nn.Module):
         msa_precropped: bool = False,
         chain_perm_gate_k: int = 1,
         permute_gt_before_noise: bool = False,
+        compute_diffusion: bool = True,
     ) -> dict[str, torch.Tensor]:
         """Training forward pass with recycling, diffusion, confidence, and distogram.
 
@@ -532,6 +533,9 @@ class DeepFold3(nn.Module):
                 trainer wraps ``self.scaler.scale(loss / accumulate).backward``.
             loss_cfg: ``TrainingConfig`` instance — needed by the chunked path
                 to compute per-chunk diffusion losses via ``diffusion_only_loss``.
+            compute_diffusion: If False, skip step 3 (the diffusion training
+                denoise). The mini-rollout still runs for the confidence head and
+                chain permutation. Used for confidence-only training.
 
         Returns:
             Dict. In the unchunked path, contains ``denoised``, ``gt_augmented``,
@@ -681,197 +685,202 @@ class DeepFold3(nn.Module):
             features["chain_perm_keep"] = cp_keep
 
         # --- 3. Diffusion training step ---
-        # Trunk-conditioning dropout (OF3 ``use_conditioning_prob``): ONE draw
-        # per forward, shared by every diffusion sample, exactly as OF3 does it
-        # (`projects/of3_all_atom/model.py:487`). Training-only. Zeroing an
-        # input still reaches every parameter, so DDP ``static_graph`` is safe.
-        diff_cfg_t = self.diffusion_head.cfg
-        use_conditioning = True
-        if self.training and diff_cfg_t.use_conditioning_prob < 1.0:
-            use_conditioning = bool(torch.rand(()) < diff_cfg_t.use_conditioning_prob)
-        # A fired drop may instead zero a random subset of inter-chain pair
-        # blocks (``cond_drop_interface_frac``). Expressed as a masked copy of
-        # the trunk pair with ``use_conditioning`` back on; crops without an
-        # interface keep the full drop. No RNG draw unless a drop fired.
-        cond_pair_keep = None
-        if (
-            not use_conditioning
-            and diff_cfg_t.cond_drop_interface_frac > 0.0
-            and features.get("asym_id") is not None
-            and bool(torch.rand(()) < diff_cfg_t.cond_drop_interface_frac)
-        ):
-            from deepfold3.model.diffusion import draw_interface_pair_keep
+        # Skipped when ``compute_diffusion`` is False (confidence-only training:
+        # the diffusion head is frozen and alpha_diffusion is 0, so the 48-sample
+        # denoise would only burn compute). ``training_loss`` then has no
+        # ``denoised`` / ``__diffusion_logged__`` and adds no diffusion terms.
+        if compute_diffusion:
+            # Trunk-conditioning dropout (OF3 ``use_conditioning_prob``): ONE draw
+            # per forward, shared by every diffusion sample, exactly as OF3 does it
+            # (`projects/of3_all_atom/model.py:487`). Training-only. Zeroing an
+            # input still reaches every parameter, so DDP ``static_graph`` is safe.
+            diff_cfg_t = self.diffusion_head.cfg
+            use_conditioning = True
+            if self.training and diff_cfg_t.use_conditioning_prob < 1.0:
+                use_conditioning = bool(torch.rand(()) < diff_cfg_t.use_conditioning_prob)
+            # A fired drop may instead zero a random subset of inter-chain pair
+            # blocks (``cond_drop_interface_frac``). Expressed as a masked copy of
+            # the trunk pair with ``use_conditioning`` back on; crops without an
+            # interface keep the full drop. No RNG draw unless a drop fired.
+            cond_pair_keep = None
+            if (
+                not use_conditioning
+                and diff_cfg_t.cond_drop_interface_frac > 0.0
+                and features.get("asym_id") is not None
+                and bool(torch.rand(()) < diff_cfg_t.cond_drop_interface_frac)
+            ):
+                from deepfold3.model.diffusion import draw_interface_pair_keep
 
-            cond_pair_keep = draw_interface_pair_keep(features["asym_id"], seq_mask)
-            if cond_pair_keep is not None:
-                use_conditioning = True
-        if self.training and diff_cfg_t.use_conditioning_prob < 1.0:
-            from deepfold3.model.diffusion import cond_drop_stats
+                cond_pair_keep = draw_interface_pair_keep(features["asym_id"], seq_mask)
+                if cond_pair_keep is not None:
+                    use_conditioning = True
+            if self.training and diff_cfg_t.use_conditioning_prob < 1.0:
+                from deepfold3.model.diffusion import cond_drop_stats
 
-            # Read by ``training_step`` into ``train/cond_drop/*``. Emitted on
-            # every forward whenever the drop is configured, so all ranks log
-            # the same key set.
-            pred["__cond_drop__"] = cond_drop_stats(
-                features.get("asym_id"), seq_mask, use_conditioning=use_conditioning, pair_keep=cond_pair_keep
+                # Read by ``training_step`` into ``train/cond_drop/*``. Emitted on
+                # every forward whenever the drop is configured, so all ranks log
+                # the same key set.
+                pred["__cond_drop__"] = cond_drop_stats(
+                    features.get("asym_id"), seq_mask, use_conditioning=use_conditioning, pair_keep=cond_pair_keep
+                )
+
+            # Masked / partial diffusion (motif scaffolding) — see
+            # ``DiffusionConfig.diffusion_mask_prob``. Built here because it needs
+            # ``asym_id``, and AFTER the chain permutation above so a "clean chain"
+            # names the same copy the GT was permuted to.
+            clean_mask = None
+            if self.training and diff_cfg_t.diffusion_mask_prob > 0.0 and features.get("asym_id") is not None:
+                from deepfold3.model.diffusion import build_diffusion_clean_mask
+
+                clean_mask = build_diffusion_clean_mask(
+                    features["asym_id"],
+                    seq_mask,
+                    diffusion_batch_size,
+                    prob=diff_cfg_t.diffusion_mask_prob,
+                    mode=diff_cfg_t.diffusion_mask_mode,
+                    min_frac=diff_cfg_t.diffusion_mask_min_frac,
+                    max_frac=diff_cfg_t.diffusion_mask_max_frac,
+                )
+
+            chunked = (
+                diffusion_chunk_size > 0
+                and backward_fn is not None
+                and loss_cfg is not None
+                and diffusion_batch_size % diffusion_chunk_size == 0
             )
+            if chunked:
+                # Detach trunk outputs into leaves so each chunk's backward can
+                # run with ``retain_graph=False`` and free its activations
+                # without dragging the (much larger) trunk graph with it. After
+                # the chunk loop, accumulated leaf grads are flowed back through
+                # the trunk in one walk. ``retain_graph=True`` keeps the trunk
+                # graph alive for the distogram backward (which still uses the
+                # attached ``embeddings["pair"]``).
+                from deepfold3.training.loss import diffusion_only_loss
 
-        # Masked / partial diffusion (motif scaffolding) — see
-        # ``DiffusionConfig.diffusion_mask_prob``. Built here because it needs
-        # ``asym_id``, and AFTER the chain permutation above so a "clean chain"
-        # names the same copy the GT was permuted to.
-        clean_mask = None
-        if self.training and diff_cfg_t.diffusion_mask_prob > 0.0 and features.get("asym_id") is not None:
-            from deepfold3.model.diffusion import build_diffusion_clean_mask
+                pair_real = embeddings["pair"]
+                single_real = embeddings["single"]
+                target_feat_real = target_feat
 
-            clean_mask = build_diffusion_clean_mask(
-                features["asym_id"],
-                seq_mask,
-                diffusion_batch_size,
-                prob=diff_cfg_t.diffusion_mask_prob,
-                mode=diff_cfg_t.diffusion_mask_mode,
-                min_frac=diff_cfg_t.diffusion_mask_min_frac,
-                max_frac=diff_cfg_t.diffusion_mask_max_frac,
-            )
+                pair_det = pair_real.detach().requires_grad_(True)
+                single_det = single_real.detach().requires_grad_(True)
+                target_feat_det = target_feat_real.detach().requires_grad_(True)
 
-        chunked = (
-            diffusion_chunk_size > 0
-            and backward_fn is not None
-            and loss_cfg is not None
-            and diffusion_batch_size % diffusion_chunk_size == 0
-        )
-        if chunked:
-            # Detach trunk outputs into leaves so each chunk's backward can
-            # run with ``retain_graph=False`` and free its activations
-            # without dragging the (much larger) trunk graph with it. After
-            # the chunk loop, accumulated leaf grads are flowed back through
-            # the trunk in one walk. ``retain_graph=True`` keeps the trunk
-            # graph alive for the distogram backward (which still uses the
-            # attached ``embeddings["pair"]``).
-            from deepfold3.training.loss import diffusion_only_loss
+                emb_det = {
+                    "pair": pair_det,
+                    "single": single_det,
+                    "target_feat": target_feat_det,
+                }
+                if cond_pair_keep is not None:
+                    from deepfold3.model.diffusion import mask_trunk_pair
 
-            pair_real = embeddings["pair"]
-            single_real = embeddings["single"]
-            target_feat_real = target_feat
+                num_chunks = diffusion_batch_size // diffusion_chunk_size
+                logged: dict[str, torch.Tensor] = {}
+                weighted_total: torch.Tensor = pair_real.new_zeros(())
+                # ``diffusion_only_loss`` assumes unbatched ``[N, ...]`` features.
+                # Always slice per batch element (batch dim is always kept).
+                B_pair = pair_real.shape[0]  # [B, N, N, C]
 
-            pair_det = pair_real.detach().requires_grad_(True)
-            single_det = single_real.detach().requires_grad_(True)
-            target_feat_det = target_feat_real.detach().requires_grad_(True)
+                for chunk_i in range(num_chunks):
+                    # ``clean_mask`` is [B, diffusion_batch_size, N]; hand each chunk
+                    # its own slice so the per-sample fire decisions are preserved.
+                    cm_c = None
+                    if clean_mask is not None:
+                        cm_c = clean_mask[:, chunk_i * diffusion_chunk_size : (chunk_i + 1) * diffusion_chunk_size]
+                    # Mask per chunk: each chunk's backward frees its graph, and a
+                    # mask node built once before the loop would be part of it.
+                    emb_c = emb_det if cond_pair_keep is None else mask_trunk_pair(emb_det, cond_pair_keep)
+                    gt_aug_c, denoised_c, noise_levels_c = self.diffusion_head.sample_training(
+                        gt_positions=diffusion_gt_pos,
+                        gt_mask=diffusion_gt_mask,
+                        embeddings=emb_c,
+                        seq_mask=seq_mask,
+                        rel_feat=rel_feat,
+                        num_samples=diffusion_chunk_size,
+                        clean_mask=cm_c,
+                        use_conditioning=use_conditioning,
+                        **ref_kwargs,
+                    )
+                    # chunk_pred shapes:
+                    #   denoised, gt_augmented: [B, S_chunk, N, M, 3]
+                    #   noise_levels: [B, S_chunk]
+                    chunk_loss = pair_real.new_zeros(())
+                    chunk_components: dict[str, torch.Tensor] = {}
+                    mini_pos_batched = pred["mini_rollout_pos"]  # [B, S_mini, N, M, 3]
+                    for b in range(B_pair):
+                        chunk_pred_b = {
+                            "denoised": denoised_c[b],
+                            "gt_augmented": gt_aug_c[b],
+                            "noise_levels": noise_levels_c[b],
+                            "mini_rollout_pos": mini_pos_batched[b],
+                        }
+                        if cm_c is not None:
+                            chunk_pred_b["diffusion_clean_mask"] = cm_c[b]
+                        if "chain_perm_gate_pos" in pred:
+                            chunk_pred_b["chain_perm_gate_pos"] = pred["chain_perm_gate_pos"][b]
+                        features_b = {
+                            k: (v[b] if isinstance(v, torch.Tensor) and v.dim() >= 1 and v.shape[0] == B_pair else v)
+                            for k, v in features.items()
+                        }
+                        loss_b, comp_b = diffusion_only_loss(chunk_pred_b, features_b, loss_cfg)
+                        chunk_loss = chunk_loss + loss_b / B_pair
+                        for k, v in comp_b.items():
+                            chunk_components[k] = chunk_components.get(k, v.new_zeros(())) + v / B_pair
+                    # Each chunk contributes 1/num_chunks of the full diffusion
+                    # loss; the accumulated grads on emb_det / diffusion params
+                    # equal the unchunked equivalent.
+                    backward_fn(chunk_loss / num_chunks)
+                    weighted_total = weighted_total + chunk_loss.detach() / num_chunks
+                    for k, v in chunk_components.items():
+                        logged[k] = logged.get(k, v.new_zeros(())) + v / num_chunks
 
-            emb_det = {
-                "pair": pair_det,
-                "single": single_det,
-                "target_feat": target_feat_det,
-            }
-            if cond_pair_keep is not None:
-                from deepfold3.model.diffusion import mask_trunk_pair
+                # Defensive: ``torch.autograd.backward`` cannot take ``None`` as a
+                # grad_tensor for a non-scalar — it raises "grad can be implicitly
+                # created only for scalar outputs" — so a leaf the diffusion path
+                # never read would kill the run on its first backward rather than
+                # being ignored. All three are read today (``single_real`` by the
+                # atom encoder's per-atom conditioning, even when the trunk single
+                # track and the conditioning concat are both off), so this filter is
+                # a guard against a future consumer being removed, not a live path.
+                flow = [
+                    (t, d.grad)
+                    for t, d in ((pair_real, pair_det), (single_real, single_det), (target_feat_real, target_feat_det))
+                    if d.grad is not None
+                ]
+                if flow:
+                    torch.autograd.backward(
+                        tensors=[t for t, _ in flow],
+                        grad_tensors=[g for _, g in flow],
+                        retain_graph=True,
+                    )
 
-            num_chunks = diffusion_batch_size // diffusion_chunk_size
-            logged: dict[str, torch.Tensor] = {}
-            weighted_total: torch.Tensor = pair_real.new_zeros(())
-            # ``diffusion_only_loss`` assumes unbatched ``[N, ...]`` features.
-            # Always slice per batch element (batch dim is always kept).
-            B_pair = pair_real.shape[0]  # [B, N, N, C]
+                pred["__diffusion_total__"] = weighted_total
+                pred["__diffusion_logged__"] = logged
+            else:
+                diff_embeddings = embeddings
+                if cond_pair_keep is not None:
+                    from deepfold3.model.diffusion import mask_trunk_pair
 
-            for chunk_i in range(num_chunks):
-                # ``clean_mask`` is [B, diffusion_batch_size, N]; hand each chunk
-                # its own slice so the per-sample fire decisions are preserved.
-                cm_c = None
-                if clean_mask is not None:
-                    cm_c = clean_mask[:, chunk_i * diffusion_chunk_size : (chunk_i + 1) * diffusion_chunk_size]
-                # Mask per chunk: each chunk's backward frees its graph, and a
-                # mask node built once before the loop would be part of it.
-                emb_c = emb_det if cond_pair_keep is None else mask_trunk_pair(emb_det, cond_pair_keep)
-                gt_aug_c, denoised_c, noise_levels_c = self.diffusion_head.sample_training(
+                    diff_embeddings = mask_trunk_pair(embeddings, cond_pair_keep)
+                gt_aug, denoised, noise_levels = self.diffusion_head.sample_training(
                     gt_positions=diffusion_gt_pos,
                     gt_mask=diffusion_gt_mask,
-                    embeddings=emb_c,
+                    embeddings=diff_embeddings,
                     seq_mask=seq_mask,
                     rel_feat=rel_feat,
-                    num_samples=diffusion_chunk_size,
-                    clean_mask=cm_c,
+                    num_samples=diffusion_batch_size,
+                    clean_mask=clean_mask,
                     use_conditioning=use_conditioning,
                     **ref_kwargs,
                 )
-                # chunk_pred shapes:
-                #   denoised, gt_augmented: [B, S_chunk, N, M, 3]
-                #   noise_levels: [B, S_chunk]
-                chunk_loss = pair_real.new_zeros(())
-                chunk_components: dict[str, torch.Tensor] = {}
-                mini_pos_batched = pred["mini_rollout_pos"]  # [B, S_mini, N, M, 3]
-                for b in range(B_pair):
-                    chunk_pred_b = {
-                        "denoised": denoised_c[b],
-                        "gt_augmented": gt_aug_c[b],
-                        "noise_levels": noise_levels_c[b],
-                        "mini_rollout_pos": mini_pos_batched[b],
-                    }
-                    if cm_c is not None:
-                        chunk_pred_b["diffusion_clean_mask"] = cm_c[b]
-                    if "chain_perm_gate_pos" in pred:
-                        chunk_pred_b["chain_perm_gate_pos"] = pred["chain_perm_gate_pos"][b]
-                    features_b = {
-                        k: (v[b] if isinstance(v, torch.Tensor) and v.dim() >= 1 and v.shape[0] == B_pair else v)
-                        for k, v in features.items()
-                    }
-                    loss_b, comp_b = diffusion_only_loss(chunk_pred_b, features_b, loss_cfg)
-                    chunk_loss = chunk_loss + loss_b / B_pair
-                    for k, v in comp_b.items():
-                        chunk_components[k] = chunk_components.get(k, v.new_zeros(())) + v / B_pair
-                # Each chunk contributes 1/num_chunks of the full diffusion
-                # loss; the accumulated grads on emb_det / diffusion params
-                # equal the unchunked equivalent.
-                backward_fn(chunk_loss / num_chunks)
-                weighted_total = weighted_total + chunk_loss.detach() / num_chunks
-                for k, v in chunk_components.items():
-                    logged[k] = logged.get(k, v.new_zeros(())) + v / num_chunks
-
-            # Defensive: ``torch.autograd.backward`` cannot take ``None`` as a
-            # grad_tensor for a non-scalar — it raises "grad can be implicitly
-            # created only for scalar outputs" — so a leaf the diffusion path
-            # never read would kill the run on its first backward rather than
-            # being ignored. All three are read today (``single_real`` by the
-            # atom encoder's per-atom conditioning, even when the trunk single
-            # track and the conditioning concat are both off), so this filter is
-            # a guard against a future consumer being removed, not a live path.
-            flow = [
-                (t, d.grad)
-                for t, d in ((pair_real, pair_det), (single_real, single_det), (target_feat_real, target_feat_det))
-                if d.grad is not None
-            ]
-            if flow:
-                torch.autograd.backward(
-                    tensors=[t for t, _ in flow],
-                    grad_tensors=[g for _, g in flow],
-                    retain_graph=True,
-                )
-
-            pred["__diffusion_total__"] = weighted_total
-            pred["__diffusion_logged__"] = logged
-        else:
-            diff_embeddings = embeddings
-            if cond_pair_keep is not None:
-                from deepfold3.model.diffusion import mask_trunk_pair
-
-                diff_embeddings = mask_trunk_pair(embeddings, cond_pair_keep)
-            gt_aug, denoised, noise_levels = self.diffusion_head.sample_training(
-                gt_positions=diffusion_gt_pos,
-                gt_mask=diffusion_gt_mask,
-                embeddings=diff_embeddings,
-                seq_mask=seq_mask,
-                rel_feat=rel_feat,
-                num_samples=diffusion_batch_size,
-                clean_mask=clean_mask,
-                use_conditioning=use_conditioning,
-                **ref_kwargs,
-            )
-            pred["denoised"] = denoised
-            pred["gt_augmented"] = gt_aug
-            pred["noise_levels"] = noise_levels
-            if clean_mask is not None:
-                # Read by ``training_loss`` so the diffusion MSE scores only the
-                # atoms whose input was noise. [B, S, N] — ``slice_batch_dict``
-                # peels the batch dim to [S, N] for the per-example loss.
-                pred["diffusion_clean_mask"] = clean_mask
+                pred["denoised"] = denoised
+                pred["gt_augmented"] = gt_aug
+                pred["noise_levels"] = noise_levels
+                if clean_mask is not None:
+                    # Read by ``training_loss`` so the diffusion MSE scores only the
+                    # atoms whose input was noise. [B, S, N] — ``slice_batch_dict``
+                    # peels the batch dim to [S, N] for the per-example loss.
+                    pred["diffusion_clean_mask"] = clean_mask
 
         # --- 4. Confidence head ---
         # ``compute_confidence`` gates only the confidence head forward so

@@ -753,6 +753,11 @@ class Trainer:
         tokens_per_opt_step = tokens_per_rank * self.dist.world_size * cfg.accumulate_grad_batches
         rank_zero_info(f"Starting training: max_steps={cfg.max_steps}")
         rank_zero_info(f"  confidence_only={cfg.train_confidence_only}")
+        if cfg.train_confidence_only:
+            rank_zero_info(
+                "  confidence-only: diffusion training denoise skipped (no diffusion loss); "
+                f"mini-rollout kept ({cfg.mini_rollout_steps} steps x {cfg.mini_rollout_samples} samples)"
+            )
         rank_zero_info(f"  lr={cfg.lr}, warmup={cfg.warmup_steps}, scheduler={cfg.finetune_scheduler}")
         rank_zero_info(
             f"  crop: max_tokens={cfg.max_tokens}, max_atoms={cfg.max_atoms}, "

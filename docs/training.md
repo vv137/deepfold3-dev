@@ -307,6 +307,8 @@ Note the floor in phase 3: `start_decay_after` is where the decay **windows star
 
 **Frozen submodules** (`freeze_modules: [evo_cond_encoder, evoformer]`): sets `requires_grad=False` on the named top-level `DeepFold3` children before DDP, optimizer and EMA are built, so they get no optimizer state and no EMA shadow (`--snapshot shadow` overlays the shadow onto the saved weights, which carry the frozen part unchanged). With no trainable parameter and no grad-requiring input the frozen trunk should build no autograd graph; confirm the memory drop in a smoke test. Exclusive with `train_confidence_only`. `configs/stage2-frozen-trunk.yaml` trains the diffusion head under stage2 conditioning dropout on a fixed trunk.
 
+**Confidence-only** (`train_confidence_only: true`): freezes everything but the confidence head and skips the diffusion training denoise (`forward_training(compute_diffusion=False)`), which would otherwise run `diffusion_batch_size` samples for a zero loss on frozen weights. The mini-rollout still runs: it gives the confidence head its positions and the chain permutation its reference. The trainer logs `confidence-only: diffusion training denoise skipped` at start; eval still runs the full forward.
+
 ### EMA
 
 Constant-decay exponential moving average (matches OF3 `ExponentialMovingAverage`):

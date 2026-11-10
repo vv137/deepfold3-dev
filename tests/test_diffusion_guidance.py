@@ -994,3 +994,23 @@ def test_repel_reads_in_the_description():
     from deepfold3.model.restraints import describe_restraint, parse_restraint_spec
 
     assert describe_restraint(parse_restraint_spec("A/5-9:B@12", repel=True)) == "A/5-9:B ≥ 12 Å"
+
+
+def test_confidence_only_skips_the_diffusion_denoise():
+    """``compute_diffusion=False`` (confidence-only training) skips the training
+    denoise entirely; the mini-rollout still runs and the confidence head still
+    gets its positions."""
+    model = _tiny_model().train()
+    called = []
+    sample_training = model.diffusion_head.sample_training
+    model.diffusion_head.sample_training = lambda *a, **kw: called.append(1) or sample_training(*a, **kw)
+    torch.manual_seed(0)
+    pred = model.forward_training(
+        _tiny_batch(), num_recycles=0, diffusion_batch_size=2, mini_rollout_steps=2, compute_diffusion=False
+    )
+    assert not called
+    assert "denoised" not in pred and "__diffusion_logged__" not in pred
+    assert "mini_rollout_pos" in pred and "plddt" in pred and "distogram" in pred
+
+    pred = model.forward_training(_tiny_batch(), num_recycles=0, diffusion_batch_size=2, mini_rollout_steps=2)
+    assert called and "denoised" in pred

@@ -167,6 +167,7 @@ def training_step(
             msa_precropped=cfg.msa_precrop,
             chain_perm_gate_k=(cfg.chain_perm_gate_k if cfg.chain_perm_stability_gate else 1),
             permute_gt_before_noise=cfg.permute_gt_before_noise,
+            compute_diffusion=not cfg.train_confidence_only,
         )
     if _timing:
         torch.cuda.synchronize(device)
