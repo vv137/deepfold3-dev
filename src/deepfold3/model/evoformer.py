@@ -135,6 +135,7 @@ class EvoformerBlock(nn.Module):
             self.pair_attn_row = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=False, optim=optim)
             self.pair_attn_col = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=True, optim=optim)
         self.pair_transition = make_transition_block(c_pair, config=optim)
+        self.pair_row_chunk = optim.pair_row_chunk if optim is not None else 0
         self.msa_transition = make_transition_block(c_msa, config=optim)
         self.use_fused_msa_transition = optim.use_fused_msa_transition_inference if optim is not None else False
         self.msa_dropout = msa_dropout
@@ -168,7 +169,7 @@ class EvoformerBlock(nn.Module):
         if self.use_triangle_attention:
             pair = dropout_add_rowwise(pair, s * self.pair_attn_row(pair, pair_mask), p_pair, training, use_fused)
             pair = dropout_add_columnwise(pair, s * self.pair_attn_col(pair, pair_mask), p_pair, training, use_fused)
-        pair = pair + s * self.pair_transition(pair)
+        pair = pair + s * map_row_chunks(self.pair_transition, pair, self.pair_row_chunk)
         return msa, pair
 
 
@@ -225,6 +226,7 @@ class PairFormerBlock(nn.Module):
             self.pair_attn_row = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=False, optim=optim)
             self.pair_attn_col = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=True, optim=optim)
         self.pair_transition = make_transition_block(c_pair, config=optim)
+        self.pair_row_chunk = optim.pair_row_chunk if optim is not None else 0
         # The per-token track. ``single`` is a pure sink in this block — it reads
         # the pair representation through ``pair_logits`` and never writes back
         # — so deleting it removes no input from the pair track.
@@ -304,7 +306,7 @@ class PairFormerBlock(nn.Module):
             # Meter the deleted branches as exactly zero rather than dropping the
             # rows — ρ_l stays comparable against a run that has them.
             b_pair_attn_row = b_pair_attn_col = pair.new_zeros(())
-        b_pair_ffn = s_pf * rmsn(self.pair_transition(pair))
+        b_pair_ffn = s_pf * rmsn(map_row_chunks(self.pair_transition, pair, self.pair_row_chunk))
         pair = pair + b_pair_ffn
         # Single update: pair → logits, then single attention.
         # PairBias is fed in unrescaled — under LNS, ``q·kᵀ ∝ s²`` softens

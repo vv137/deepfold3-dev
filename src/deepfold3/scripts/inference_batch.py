@@ -799,6 +799,7 @@ def inference_batch(
 
     n_done = 0
     n_skipped = 0
+    oom: list[str] = []
     t_total = time.perf_counter()
     for idx, (jp, od) in enumerate(jobs, 1):
         if skip_existing and _job_complete(od):
@@ -809,35 +810,41 @@ def inference_batch(
             click.echo(f"[batch] [{idx}/{len(jobs)}] MISS {jp} — not found")
             continue
         click.echo(f"[batch] [{idx}/{len(jobs)}] {jp.name} → {od}")
-        _run_one_job(
-            model,
-            model_cfg,
-            dev,
-            jp,
-            od,
-            num_recycles=num_recycles,
-            num_samples=num_samples,
-            seeds=seed_list,
-            template_cache=template_cache,
-            pdb_mmcif_dir=pdb_mmcif_dir,
-            msa_pairing=msa_pairing,
-            plot_confidences=plot_confidences,
-            save_distogram=save_distogram,
-            logits_scheme=logits_scheme,
-            skip_existing=skip_existing,
-            bucket=bucket,
-            precision=precision,
-            guidance_specs=guidance_specs,
-            allow_overlap=allow_guidance_overlap,
-            restraint_specs=tuple(restraint_specs) + tuple(restraint_pair_specs) + tuple(repel_specs),
-            restraint_weight=restraint_weight,
-            restraint_rigid=restraint_rigid,
-            restraint_max_step=restraint_max_step,
-            restraint_after_step=restraint_after_step,
-            restraint_after_sigma=restraint_after_sigma,
-            manifest_fields=manifest_fields,
-        )
-        n_done += 1
+        try:
+            _run_one_job(
+                model,
+                model_cfg,
+                dev,
+                jp,
+                od,
+                num_recycles=num_recycles,
+                num_samples=num_samples,
+                seeds=seed_list,
+                template_cache=template_cache,
+                pdb_mmcif_dir=pdb_mmcif_dir,
+                msa_pairing=msa_pairing,
+                plot_confidences=plot_confidences,
+                save_distogram=save_distogram,
+                logits_scheme=logits_scheme,
+                skip_existing=skip_existing,
+                bucket=bucket,
+                precision=precision,
+                guidance_specs=guidance_specs,
+                allow_overlap=allow_guidance_overlap,
+                restraint_specs=tuple(restraint_specs) + tuple(restraint_pair_specs) + tuple(repel_specs),
+                restraint_weight=restraint_weight,
+                restraint_rigid=restraint_rigid,
+                restraint_max_step=restraint_max_step,
+                restraint_after_step=restraint_after_step,
+                restraint_after_sigma=restraint_after_sigma,
+                manifest_fields=manifest_fields,
+            )
+            n_done += 1
+        except torch.OutOfMemoryError as e:
+            # One target too large for the GPU must not take the rest of the
+            # shard down with it. Seeds it finished stay on disk for --skip-existing.
+            click.echo(f"[batch] [{idx}/{len(jobs)}] OOM {jp} — {str(e).splitlines()[0]}")
+            oom.append(str(jp))
         # Release this job's cached blocks back to the driver before the next
         # target. Bucketing folds varied N (=> varied allocation sizes), and
         # per-shape Triton autotune allocates scratch, so cached blocks
@@ -849,7 +856,9 @@ def inference_batch(
             torch.cuda.empty_cache()
 
     elapsed = time.perf_counter() - t_total
-    click.echo(f"[batch] finished: {n_done} done, {n_skipped} skipped  ({elapsed:.1f}s total)")
+    click.echo(f"[batch] finished: {n_done} done, {n_skipped} skipped, {len(oom)} OOM  ({elapsed:.1f}s total)")
+    if oom:
+        raise click.ClickException(f"{len(oom)} job(s) ran out of GPU memory: " + ", ".join(oom))
 
 
 if __name__ == "__main__":
