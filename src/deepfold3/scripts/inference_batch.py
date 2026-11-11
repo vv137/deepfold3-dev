@@ -384,6 +384,14 @@ def _run_one_job(
 
                 plot_confidences_file(conf_path, conf_path.with_suffix(".png"))
 
+        # Free this seed's outputs before the next seed's forward. Otherwise
+        # ``model_output`` (PAE/PDE [S, N, N, 64] fp32, ~16 GiB at N=2560) stays
+        # alive until the next forward returns: at N=2560 the first seed fits
+        # and the second OOMs in the confidence head.
+        del model_output, iter_feats
+        if feats["res_type"].is_cuda:
+            torch.cuda.empty_cache()
+
     if summaries:
         save_ranking_scores_csv(output_dir / "ranking_scores.csv", summaries)
         summary_name = f"{job_name}_summary_confidences.json" if job_name else "summary_confidences.json"
