@@ -40,6 +40,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import time
+import traceback
 from pathlib import Path
 
 import click
@@ -844,6 +845,9 @@ def inference_batch(
             # One target too large for the GPU must not take the rest of the
             # shard down with it. Seeds it finished stay on disk for --skip-existing.
             click.echo(f"[batch] [{idx}/{len(jobs)}] OOM {jp} — {str(e).splitlines()[0]}")
+            # Where it ran out: the model frames, innermost last (no locals kept).
+            for fr in [f for f in traceback.extract_tb(e.__traceback__) if "site-packages" not in f.filename][-10:]:
+                click.echo(f"[batch]     at {fr.filename}:{fr.lineno} in {fr.name}: {fr.line}")
             oom.append(str(jp))
         # Release this job's cached blocks back to the driver before the next
         # target. Bucketing folds varied N (=> varied allocation sizes), and
