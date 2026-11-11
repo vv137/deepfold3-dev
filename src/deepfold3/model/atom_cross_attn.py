@@ -30,7 +30,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from deepfold3.model.primitives import LayerNorm, LinearNoBias, af3_linear_init_, layer_norm
+from deepfold3.model.primitives import LayerNorm, LinearNoBias, af3_linear_init_, layer_norm, map_pair_rows
 
 
 @dataclasses.dataclass
@@ -1060,6 +1060,8 @@ class AtomEncoder(nn.Module):
         # AF3: embed_trunk_pair_cond uses final_init (zeros)
         self.lnorm_trunk_pair_w = nn.Parameter(torch.ones(c_trunk_pair))
         self.embed_trunk_pair = LinearNoBias(c_trunk_pair, cp, initializer="zeros")
+        # ``OptimConfig.pair_chunk_budget_bytes``; set by ``DiffusionHead``.
+        self.pair_chunk_budget = 0
 
         # Encoder-specific additional pair conditioning (_1 variants)
         self.single_to_pair_row_enc = LinearNoBias(c, cp)
@@ -1118,8 +1120,12 @@ class AtomEncoder(nn.Module):
         offsets_valid = _offsets_valid(subsets, ref_space_uid)
 
         # --- Trunk pair contribution ---
-        tp_norm = layer_norm(trunk_pair, [trunk_pair.shape[-1]]) * self.lnorm_trunk_pair_w
-        tp_proj = self.embed_trunk_pair(tp_norm)  # [B?, N, N, cp]
+        tp_proj = map_pair_rows(  # [B?, N, N, cp]
+            lambda rows: self.embed_trunk_pair(layer_norm(rows, [rows.shape[-1]]) * self.lnorm_trunk_pair_w),
+            trunk_pair,
+            self.pair_chunk_budget,
+            4 * trunk_pair.shape[-1],
+        )
         pair_idx = subsets.token_for_query.unsqueeze(-1) * N + subsets.token_for_key.unsqueeze(-2)
         pair_valid = subsets.ta_to_q_mask.unsqueeze(-1) & subsets.q_to_k_mask.unsqueeze(-2)
         if has_batch:

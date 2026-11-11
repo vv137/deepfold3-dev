@@ -210,6 +210,7 @@ class OptimConfig:
     use_fused_ln_transpose: bool = False    # Triton LN+transpose for column attention
     use_fused_msa_transition_inference: bool = False  # in-place forward-only MSA transition (inference preset only)
     use_torch_compile: bool = False         # torch.compile for attention + TriangleMul
+    pair_chunk_budget_bytes: int = 0        # inference: row-chunk wide pair-scale intermediates (inference preset: 4 GiB)
 ```
 
 ### Python API
@@ -229,7 +230,7 @@ print_availability()
 
 | `--optim` | Kernels | Numerics |
 | --- | --- | --- |
-| `inference` (default) | Triton evo attention, pair bias, SwiGLU, channel-major TriangleMul, MSA transition; OPM and MSA chunking | Differs from training within each kernel's error |
+| `inference` (default) | Triton evo attention, pair bias, SwiGLU, channel-major TriangleMul, MSA transition; OPM, MSA and pair-budget chunking | Differs from training within each kernel's error |
 | `train-matched` | What the checkpoint recorded; refuses a checkpoint with no `OptimConfig` | The kernels the weights were fitted through |
 | `none` | Stock PyTorch | Reference; also makes `--matmul-precision auto` use true fp32 |
 | `inference-cueq` | `inference` with cuEquivariance's TriangleMul; needs `uv sync --group cueq` | Slower than the channel-major TriangleMul, see below |
@@ -261,6 +262,19 @@ A requested kernel that cannot run is never a silent stock run:
 `use_fused_transition_pair` and `use_tiled_linear` are gated to C in (64, 128). At `pair_channel=256` they reach only the C=128 MSA and template transitions, never the pair transitions.
 
 `cuequivariance-ops-torch-cu13` is NVIDIA proprietary software, so the `cueq` group stays optional. Below its own size threshold the package runs its PyTorch path.
+
+### Pair chunk budget
+
+`OptimConfig.pair_chunk_budget_bytes` (inference preset: 4 GiB) is one bound for every op that materializes a wide pair-scale intermediate. Each site knows the width of its widest tensor per pair position and runs `budget // (N * width)` pair rows per call, rounded down to a power of two (`primitives.budget_rows`, `map_pair_rows`); when the whole `[N, N]` tensor fits, the site runs whole, exactly as with a budget of 0. The ops are row-independent, so chunking changes no math, only GEMM shapes. With grad enabled nothing is chunked.
+
+| Site | Widest tensor at N=2560 (unchunked) |
+| --- | --- |
+| Diffusion pair conditioning (`DiffusionConditioningBlock._pair_cond`: concat, LN, projection, `pair_trans0/1`) | SwiGLU input `[N, N, 1024]` fp32 (the sampler runs without autocast), 25 GiB |
+| Trunk, MSA-stack and confidence pair transitions | SwiGLU input `[N, N, 2048]` bf16, 25 GiB |
+| Template pair transition (C=128) | `[N, N, 512]` bf16, 6.25 GiB |
+| LayerNorm + projection on the pair: recycled `prev_embedding`, template `embed_query`, MSA-attention and single-attention pair logits, diffusion `hoist_pair_logits`, atom-encoder trunk pair, PAE / PDE / distogram logits | LayerNorm output `[N, N, 256]` fp32, 6.25 GiB |
+
+At 4 GiB the trunk transitions run whole up to N=1024 and in 256-row chunks at N=2560; the LayerNorm sites run whole up to N=2048. `msa_row_chunk` and `tiled_opm_chunk` stay separate: the first bounds the MSA depth axis, not `N²`, and the OPM tile is already two-dimensional and constant in N. Still unchunked: TriangleMul (`fused_trimul` keeps its `[2C, N, N]` planes, 6.25 GiB) and GridSelfAttention's per-row Q/K/V/G.
 
 ### Recommended Configuration
 

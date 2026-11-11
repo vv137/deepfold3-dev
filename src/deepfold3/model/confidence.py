@@ -30,7 +30,7 @@ from deepfold3.model.config import ConfidenceConfig, OptimConfig
 from deepfold3.model.embedders import DGRAM_NUM_BINS, dgram_from_positions
 from deepfold3.model.evoformer import PairFormerBlock, _resolve_branch_residual_gain
 from deepfold3.model.precision import fp32_scope
-from deepfold3.model.primitives import LayerNorm, LinearNoBias, block_residual_scale
+from deepfold3.model.primitives import LayerNorm, LinearNoBias, block_residual_scale, budget_rows, map_row_chunks
 
 torch_checkpoint = _partial(_torch_checkpoint, use_reentrant=False, determinism_check="none")
 
@@ -74,6 +74,7 @@ class ConfidenceHead(nn.Module):
         # with the sample alone, its backward recompute holds all four layers'
         # intermediates at once, which ran a 640-token crop out of a 95 GB GH200.
         self._grad_checkpoint = bool(optim and optim.use_gradient_checkpointing)
+        self.pair_chunk_budget = optim.pair_chunk_budget_bytes if optim is not None else 0
 
         # _embed_features: target_feat outer-sum + distogram from positions
         self.left_target_feat_project = LinearNoBias(target_feat_dim, c_pair)
@@ -300,13 +301,23 @@ class ConfidenceHead(nn.Module):
 
         # fp32_scope is what actually holds LN + matmul in fp32: a bare
         # ``.float()`` upcast is otherwise re-downcast by autocast on entry.
+        # Over the pair chunk budget, the PAE / PDE heads run row-chunked, so the
+        # fp32 copy of the pair and its LayerNorm exist one chunk at a time.
+        rows = 0
+        if not return_pre_logits and not torch.is_grad_enabled():
+            rows = budget_rows(self.pair_chunk_budget, pair_act.shape[-2], 4 * pair_act.shape[-1])
         with fp32_scope(self.fp32):
-            pair_act = pair_act.float()
             single_act = single_act.float()
 
             plddt = self.plddt_logits(self.plddt_logits_ln(single_act))
             exp_res = self.exp_resolved_logits(self.exp_resolved_ln(single_act))
 
+            if rows:
+                pae = map_row_chunks(lambda r: self.pae_logits(self.pae_logits_ln(r.float())), pair_act, rows)
+                pde_half = map_row_chunks(lambda r: self.pde_half_logits(self.pde_logits_ln(r.float())), pair_act, rows)
+                return plddt, exp_res, pae, pde_half + pde_half.transpose(-3, -2)
+
+            pair_act = pair_act.float()
             if return_pre_logits:
                 pae = self.pae_logits_ln(pair_act)
                 pde = self.pde_logits_ln(pair_act)

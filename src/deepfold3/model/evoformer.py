@@ -47,6 +47,8 @@ from deepfold3.model.primitives import (
     LayerNorm,
     LinearNoBias,
     block_residual_scale,
+    map_pair_rows,
+    map_pair_transition,
     map_row_chunks,
 )
 from deepfold3.model.template_embedding import TemplateEmbedding
@@ -135,7 +137,7 @@ class EvoformerBlock(nn.Module):
             self.pair_attn_row = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=False, optim=optim)
             self.pair_attn_col = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=True, optim=optim)
         self.pair_transition = make_transition_block(c_pair, config=optim)
-        self.pair_row_chunk = optim.pair_row_chunk if optim is not None else 0
+        self.pair_chunk_budget = optim.pair_chunk_budget_bytes if optim is not None else 0
         self.msa_transition = make_transition_block(c_msa, config=optim)
         self.use_fused_msa_transition = optim.use_fused_msa_transition_inference if optim is not None else False
         self.msa_dropout = msa_dropout
@@ -169,7 +171,7 @@ class EvoformerBlock(nn.Module):
         if self.use_triangle_attention:
             pair = dropout_add_rowwise(pair, s * self.pair_attn_row(pair, pair_mask), p_pair, training, use_fused)
             pair = dropout_add_columnwise(pair, s * self.pair_attn_col(pair, pair_mask), p_pair, training, use_fused)
-        pair = pair + s * map_row_chunks(self.pair_transition, pair, self.pair_row_chunk)
+        pair = pair + s * map_pair_transition(self.pair_transition, pair, self.pair_chunk_budget, 4)
         return msa, pair
 
 
@@ -226,7 +228,7 @@ class PairFormerBlock(nn.Module):
             self.pair_attn_row = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=False, optim=optim)
             self.pair_attn_col = GridSelfAttention(c_pair, num_heads=num_pair_heads, transpose=True, optim=optim)
         self.pair_transition = make_transition_block(c_pair, config=optim)
-        self.pair_row_chunk = optim.pair_row_chunk if optim is not None else 0
+        self.pair_chunk_budget = optim.pair_chunk_budget_bytes if optim is not None else 0
         # The per-token track. ``single`` is a pure sink in this block — it reads
         # the pair representation through ``pair_logits`` and never writes back
         # — so deleting it removes no input from the pair track.
@@ -306,7 +308,7 @@ class PairFormerBlock(nn.Module):
             # Meter the deleted branches as exactly zero rather than dropping the
             # rows — ρ_l stays comparable against a run that has them.
             b_pair_attn_row = b_pair_attn_col = pair.new_zeros(())
-        b_pair_ffn = s_pf * rmsn(map_row_chunks(self.pair_transition, pair, self.pair_row_chunk))
+        b_pair_ffn = s_pf * rmsn(map_pair_transition(self.pair_transition, pair, self.pair_chunk_budget, 4))
         pair = pair + b_pair_ffn
         # Single update: pair → logits, then single attention.
         # PairBias is fed in unrescaled — under LNS, ``q·kᵀ ∝ s²`` softens
@@ -317,7 +319,12 @@ class PairFormerBlock(nn.Module):
         # consumed as ``pair_logits`` for the SingleAttention PairBias path);
         # leave it un-RMSNormed.
         if self.use_single_track:
-            pair_logits = self.single_to_pair(self.single_to_pair_norm(pair))  # [..., N, N, H]
+            pair_logits = map_pair_rows(  # [..., N, N, H]
+                lambda rows: self.single_to_pair(self.single_to_pair_norm(rows)),
+                pair,
+                self.pair_chunk_budget,
+                4 * pair.shape[-1],  # the fp32-or-input-dtype LayerNorm output
+            )
             pair_logits = pair_logits.movedim(-1, -3)  # [..., H, N, N]
             b_single_attn = s_single_attn * rmsn(self.single_attn(single, seq_mask, pair_logits))
             single = single + b_single_attn
@@ -369,6 +376,7 @@ class Evoformer(nn.Module):
     ):
         super().__init__()
         self._grad_checkpoint = bool(optim and optim.use_gradient_checkpointing)
+        self.pair_chunk_budget = optim.pair_chunk_budget_bytes if optim is not None else 0
         c_msa = cfg.msa_channel
         c_pair = cfg.pair_channel
         c_single = cfg.seq_channel
@@ -510,7 +518,12 @@ class Evoformer(nn.Module):
         pair = left + right  # [..., N, N, c_pair]
 
         # Add recycling pair
-        pair = pair + self.prev_embedding(self.prev_embedding_layer_norm(prev_pair))
+        pair = pair + map_pair_rows(
+            lambda rows: self.prev_embedding(self.prev_embedding_layer_norm(rows)),
+            prev_pair,
+            self.pair_chunk_budget,
+            4 * prev_pair.shape[-1],
+        )
 
         # Add relative position encoding
         pair = pair + self.position_activations(rel_feat)

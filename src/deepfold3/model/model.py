@@ -29,7 +29,7 @@ from deepfold3.model.embedders import compute_rel_feat_dim, create_relative_enco
 from deepfold3.model.evoformer import Evoformer
 from deepfold3.model.masked_msa import MaskedMSAHead, apply_bert_mask
 from deepfold3.model.precision import fp32_scope
-from deepfold3.model.primitives import TRUNCATED_NORMAL_STDDEV_FACTOR, LayerNorm, LinearNoBias
+from deepfold3.model.primitives import TRUNCATED_NORMAL_STDDEV_FACTOR, LayerNorm, LinearNoBias, map_pair_rows
 from deepfold3.model.restraints import Restraint
 
 # Disable the determinism metadata check that compares saved vs recomputed
@@ -96,6 +96,8 @@ class DistogramHead(nn.Module):
         # non-zero gradient to ``pair`` from step 0. ``α = 0`` recovers
         # AF3's zeros init.
         self.half_logits = LinearNoBias(pair_channels, self.num_bins)
+        # ``OptimConfig.pair_chunk_budget_bytes``; set by ``DeepFold3``.
+        self.pair_chunk_budget = 0
         alpha = float(getattr(cfg, "half_logits_init_alpha", 0.0))
         if alpha == 0.0:
             nn.init.zeros_(self.half_logits.weight)
@@ -108,11 +110,14 @@ class DistogramHead(nn.Module):
     def forward(self, pair: torch.Tensor) -> torch.Tensor:
         """Symmetrised logits [..., N, N, num_bins]."""
         with fp32_scope(self.fp32):
-            z = pair.float() if self.fp32 else pair
-            if self.half_logits_ln is not None:
-                z = self.half_logits_ln(z)
-            h = self.half_logits(z)
+            h = map_pair_rows(self._half_logits, pair, self.pair_chunk_budget, 4 * pair.shape[-1])
         return h + h.transpose(-3, -2)
+
+    def _half_logits(self, pair: torch.Tensor) -> torch.Tensor:
+        z = pair.float() if self.fp32 else pair
+        if self.half_logits_ln is not None:
+            z = self.half_logits_ln(z)
+        return self.half_logits(z)
 
     def expected_distance(self, pair: torch.Tensor) -> torch.Tensor:
         """Expected Cβ–Cβ distance in Å, shape [..., N, N]."""
@@ -173,6 +178,7 @@ class DeepFold3(nn.Module):
 
         # Distogram head
         self.distogram_head = DistogramHead(ec.pair_channel, cfg=cfg.distogram, fp32=cfg.precision.fp32_distogram_head)
+        self.distogram_head.pair_chunk_budget = cfg.optim.pair_chunk_budget_bytes
 
         # Masked-MSA (BERT) head — optional self-supervised MSA objective.
         # Reads the final MSA-stack representation + trunk single repr.

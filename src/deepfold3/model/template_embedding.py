@@ -45,7 +45,13 @@ from deepfold3.model.config import OptimConfig, TemplateEmbeddingConfig
 from deepfold3.model.embedders import dgram_from_positions as _dgram_from_positions
 from deepfold3.model.ops import TriangleMulIncoming, TriangleMulOutgoing
 from deepfold3.model.optim import make_transition_block
-from deepfold3.model.primitives import LayerNorm, LinearNoBias, block_residual_scale
+from deepfold3.model.primitives import (
+    LayerNorm,
+    LinearNoBias,
+    block_residual_scale,
+    map_pair_rows,
+    map_pair_transition,
+)
 from deepfold3.model.triton.dropout_add import dropout_add_columnwise, dropout_add_rowwise
 
 _checkpoint = partial(_torch_checkpoint, use_reentrant=False, determinism_check="none")
@@ -205,6 +211,8 @@ class TemplatePairFormerBlock(nn.Module):
         self.pair_attn_row = GridSelfAttention(num_channels, num_heads=num_heads, transpose=False, optim=optim)
         self.pair_attn_col = GridSelfAttention(num_channels, num_heads=num_heads, transpose=True, optim=optim)
         self.pair_transition = make_transition_block(num_channels, num_intermediate_factor, config=optim)
+        self.num_intermediate_factor = num_intermediate_factor
+        self.pair_chunk_budget = optim.pair_chunk_budget_bytes if optim is not None else 0
         self.pair_dropout = pair_dropout
         self.use_fused_dropout = optim.use_fused_dropout_add if optim is not None else True
         self.residual_out_scale = float(residual_out_scale)
@@ -226,7 +234,9 @@ class TemplatePairFormerBlock(nn.Module):
         pair = dropout_add_rowwise(pair, s * self.tri_mul_in(pair, pair_mask), p, training, use_fused)
         pair = dropout_add_rowwise(pair, s * self.pair_attn_row(pair, pair_mask), p, training, use_fused)
         pair = dropout_add_columnwise(pair, s * self.pair_attn_col(pair, pair_mask), p, training, use_fused)
-        pair = pair + s * self.pair_transition(pair)
+        pair = pair + s * map_pair_transition(
+            self.pair_transition, pair, self.pair_chunk_budget, self.num_intermediate_factor
+        )
         return pair
 
 
@@ -260,6 +270,7 @@ class SingleTemplateEmbedding(nn.Module):
         pc = cfg.pair_channel
         # Per-block activation checkpointing, as the trunk stacks do.
         self._grad_checkpoint = bool(optim and optim.use_gradient_checkpointing)
+        self.pair_chunk_budget = optim.pair_chunk_budget_bytes if optim is not None else 0
 
         # 9 input feature projections (AF3: template_pair_embedding_* uses initializer='relu')
         self.embed_dgram = LinearNoBias(cfg.dgram_num_bins, c, initializer="relu")
@@ -401,7 +412,12 @@ class SingleTemplateEmbedding(nn.Module):
         act = act + self.embed_unit_vec_y(unit_y.to(dtype))
         act = act + self.embed_unit_vec_z(unit_z.to(dtype))
         act = act + self.embed_backbone_mask(bb_mask_2d.unsqueeze(-1).to(dtype))
-        act = act + self.embed_query(self.query_norm(query_pair))
+        act = act + map_pair_rows(
+            lambda rows: self.embed_query(self.query_norm(rows)),
+            query_pair,
+            self.pair_chunk_budget,
+            4 * query_pair.shape[-1],
+        )
 
         # Template PairFormer stack (TemplatePairFormerBlock uses the same
         # batched primitives as the trunk).

@@ -318,29 +318,71 @@ def pad_row_chunk(rows: torch.Tensor, chunk: int) -> torch.Tensor:
     return torch.cat([rows, rows.new_zeros(*rows.shape[:-3], missing, *rows.shape[-2:])], dim=-3)
 
 
-def map_row_chunks(fn, x: torch.Tensor, chunk: int) -> torch.Tensor:
-    """``fn(x)`` over ``chunk`` rows of dim ``-3`` at a time, into one output.
+def map_row_chunks(fn, x: torch.Tensor, chunk: int, *more: torch.Tensor) -> torch.Tensor:
+    """``fn(x, *more)`` over ``chunk`` rows of dim ``-3`` at a time, into one output.
 
-    ``fn`` must treat rows independently and keep the shape. Inference only:
-    with grad enabled, or ``chunk`` of 0 or at least the row count, this is
-    plain ``fn(x)``.
+    ``fn`` must treat rows independently and keep dims ``-3`` and ``-2``. Inference
+    only: with grad enabled, or ``chunk`` of 0 or at least the row count, this is
+    plain ``fn(x, *more)``.
 
     Args:
-        fn: Row-independent function of ``[..., S, N, C]``.
+        fn: Row-independent function of ``[..., S, N, C]`` tensors.
         x: Input ``[..., S, N, C]``.
         chunk: Rows per call.
+        *more: Further inputs ``[..., S, N, C']``, sliced along with ``x``.
 
     Returns:
-        The same as ``fn(x)``.
+        The same as ``fn(x, *more)``.
     """
     S = x.shape[-3]
     if chunk <= 0 or S <= chunk or torch.is_grad_enabled():
-        return fn(x)
+        return fn(x, *more)
     out = None
     for s0 in range(0, S, chunk):
-        rows = pad_row_chunk(x[..., s0 : s0 + chunk, :, :], chunk)
-        update = fn(rows)
+        rows = [pad_row_chunk(t[..., s0 : s0 + chunk, :, :], chunk) for t in (x, *more)]
+        update = fn(*rows)
         if out is None:
-            out = update.new_empty(*x.shape[:-3], S, *update.shape[-2:])
+            out = update.new_empty(*update.shape[:-3], S, *update.shape[-2:])
         out[..., s0 : s0 + chunk, :, :] = update[..., : min(chunk, S - s0), :, :]
     return out
+
+
+def gemm_itemsize(x: torch.Tensor) -> int:
+    """Bytes per element of a matmul output on ``x``: autocast's dtype when it is on."""
+    if torch.is_autocast_enabled(x.device.type):
+        return torch.get_autocast_dtype(x.device.type).itemsize
+    return x.element_size()
+
+
+def budget_rows(budget: int, n: int, bytes_per_position: int) -> int:
+    """Pair rows per chunk under ``OptimConfig.pair_chunk_budget_bytes``.
+
+    The widest intermediate of a ``[rows, n]`` slab, ``bytes_per_position`` per
+    pair position, stays within ``budget``. Rounded down to a power of two so the
+    chunk shapes, and with them the Triton autotune keys, stay few.
+
+    Args:
+        budget: Bytes; 0 disables chunking.
+        n: Pair columns (tokens).
+        bytes_per_position: Size of the widest intermediate per pair position.
+
+    Returns:
+        Rows per :func:`map_row_chunks` call, or 0 (whole tensor) when the whole
+        ``[n, n]`` tensor already fits.
+    """
+    if budget <= 0:
+        return 0
+    rows = budget // (n * bytes_per_position)
+    if rows >= n:
+        return 0
+    return 1 << (max(rows, 1).bit_length() - 1)
+
+
+def map_pair_rows(fn, x: torch.Tensor, budget: int, bytes_per_position: int, *more: torch.Tensor) -> torch.Tensor:
+    """:func:`map_row_chunks` with the rows from :func:`budget_rows` for an ``[..., N, N, C]`` ``x``."""
+    return map_row_chunks(fn, x, budget_rows(budget, x.shape[-2], bytes_per_position), *more)
+
+
+def map_pair_transition(transition, x: torch.Tensor, budget: int, factor: int) -> torch.Tensor:
+    """A pair ``TransitionBlock`` under the pair chunk budget; its widest tensor is ``2 * factor * C``."""
+    return map_pair_rows(transition, x, budget, 2 * factor * x.shape[-1] * gemm_itemsize(x))

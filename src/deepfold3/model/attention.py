@@ -40,7 +40,7 @@ import torch.nn.functional as F
 
 from deepfold3.model import kernel_census
 from deepfold3.model.config import OptimConfig
-from deepfold3.model.primitives import LayerNorm, LinearNoBias, af3_linear_init_, map_row_chunks
+from deepfold3.model.primitives import LayerNorm, LinearNoBias, af3_linear_init_, map_pair_rows, map_row_chunks
 
 
 def _load_evo_attn():
@@ -290,15 +290,16 @@ class MSAAttention(nn.Module):
         self.to_g = LinearNoBias(c_msa, num_heads * self.head_dim, initializer="zeros")
         self.out_proj = LinearNoBias(num_heads * self.head_dim, c_msa, initializer="zeros")
         self.row_chunk = optim.msa_row_chunk if optim is not None else 0
+        self.pair_chunk_budget = optim.pair_chunk_budget_bytes if optim is not None else 0
         if optim is not None and optim.use_torch_compile:
             self._compute = torch.compile(self._compute)
 
     def _row_weights(self, msa: torch.Tensor, mask: torch.Tensor, pair: torch.Tensor) -> torch.Tensor:
         """Pair-derived averaging weights ``[B, H, N, N]``, shared by every row."""
         N = msa.shape[2]
-        pair = self.pair_norm(pair)
-
-        logits = self.pair_logits(pair).permute(0, 3, 1, 2)
+        logits = map_pair_rows(
+            lambda rows: self.pair_logits(self.pair_norm(rows)), pair, self.pair_chunk_budget, 4 * pair.shape[-1]
+        ).permute(0, 3, 1, 2)
         col_mask, _ = mask.max(dim=-2)
         logits = logits + 1e9 * (col_mask.float() - 1.0).view(msa.shape[0], 1, 1, N)
         return F.softmax(logits.float(), dim=-1)

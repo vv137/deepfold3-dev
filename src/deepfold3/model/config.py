@@ -746,12 +746,14 @@ class OptimConfig:
     # itself, and a fixed row count keeps Triton autotune keys constant across
     # MSA depths. 0 = whole tensor. Ignored whenever grad is enabled.
     msa_row_chunk: int = 0
-    # Inference only: evaluate the pair transition this many pair rows at a
-    # time. Its SwiGLU hidden is [N, N, 8*c_pair]: 25 GiB in bf16 at N=2560,
-    # c_pair=256, which alone overflows a 96 GB GPU. The transition is
-    # per-position, so chunking is exact. 0 = whole tensor. Ignored whenever
-    # grad is enabled.
-    pair_row_chunk: int = 0
+    # Inference only: one memory budget, in bytes, for every pair-scale op that
+    # materializes a wide ``[N, N, C']`` intermediate (pair transitions, the
+    # diffusion pair conditioning, pair LayerNorm + projection heads). Each runs
+    # ``budget // (N * C' * itemsize)`` pair rows at a time, rounded down to a
+    # power of two; when the whole tensor fits it runs whole, as with 0. The ops
+    # are row-independent, so chunking is exact. Ignored whenever grad is
+    # enabled. See docs/optimizations.md "Pair chunk budget".
+    pair_chunk_budget_bytes: int = 0
 
     # Gradient checkpointing on the 4-layer Evoformer (MSA) stack and the
     # 48-layer PairFormer trunk. Essential for training — without it, 48 layers
@@ -797,7 +799,7 @@ class OptimConfig:
             use_fused_msa_transition_inference=True,
             tiled_opm_chunk=128,
             msa_row_chunk=512,
-            pair_row_chunk=256,
+            pair_chunk_budget_bytes=4 << 30,
         )
 
     @classmethod

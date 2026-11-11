@@ -37,7 +37,11 @@ from deepfold3.model.primitives import (
     LayerNorm,
     LinearNoBias,
     af3_linear_init_,
+    budget_rows,
+    gemm_itemsize,
     layer_norm,
+    map_pair_rows,
+    map_row_chunks,
 )
 from deepfold3.model.restraints import Restraint, active_restraints, restraint_gradient, rigid_displacement
 
@@ -617,16 +621,31 @@ class DiffusionTransformer(nn.Module):
 
         # Scale-only output norm (create_offset=False in AF3)
         self.output_norm_w = nn.Parameter(torch.ones(c))
+        self.pair_chunk_budget = optim.pair_chunk_budget_bytes if optim is not None else 0
 
     def hoist_pair_logits(
         self,
         pair_cond: torch.Tensor,  # [B, N, N, c_pair]
         mask: torch.Tensor,  # [B, N]  float
     ) -> tuple[torch.Tensor, ...]:
-        """Per super-block pair logits ``[B, sbs*H, N, N]``, padding mask folded in."""
-        pair_norm = layer_norm(pair_cond, [pair_cond.shape[-1]]) * self.pair_norm_w
+        """Per super-block pair logits ``[B, sbs*H, N, N]``, padding mask folded in.
+
+        Over the pair chunk budget, each projection runs row-chunked and redoes the
+        LayerNorm per chunk, so the full normalized pair is never held.
+        """
         bias = 1e9 * (mask.float() - 1.0)[:, None, None, :]
-        return tuple(proj(pair_norm).movedim(-1, -3).float() + bias for proj in self.pair_logits_proj)
+        rows = budget_rows(self.pair_chunk_budget, pair_cond.shape[-2], 4 * pair_cond.shape[-1])
+        if rows == 0 or torch.is_grad_enabled():
+            pair_norm = layer_norm(pair_cond, [pair_cond.shape[-1]]) * self.pair_norm_w
+            return tuple(proj(pair_norm).movedim(-1, -3).float() + bias for proj in self.pair_logits_proj)
+
+        def logits(proj: nn.Module) -> torch.Tensor:
+            def fn(r: torch.Tensor) -> torch.Tensor:
+                return proj(layer_norm(r, [r.shape[-1]]) * self.pair_norm_w)
+
+            return map_row_chunks(fn, pair_cond, rows)
+
+        return tuple(logits(proj).movedim(-1, -3).float() + bias for proj in self.pair_logits_proj)
 
     def forward_hoisted(
         self,
@@ -725,6 +744,8 @@ class DiffusionConditioningBlock(nn.Module):
         self.pair_trans1 = make_transition_block(
             c_pair_out, num_intermediate_factor=num_intermediate_factor, config=optim
         )
+        self.num_intermediate_factor = num_intermediate_factor
+        self.pair_chunk_budget = optim.pair_chunk_budget_bytes if optim is not None else 0
 
         # Single conditioning: concat(single_embedding, target_feat) → linear.
         # ``use_trunk_single=False`` drops the trunk half and conditions on
@@ -783,6 +804,13 @@ class DiffusionConditioningBlock(nn.Module):
         emb = x.unsqueeze(-1) * w + b
         return torch.cos(2 * math.pi * emb)
 
+    def _pair_cond(self, pair_emb: torch.Tensor, rel_feat: torch.Tensor) -> torch.Tensor:
+        pair_in = torch.cat([pair_emb, rel_feat], dim=-1)
+        pair_norm = layer_norm(pair_in, [pair_in.shape[-1]]) * self.pair_cond_norm_w
+        pair_cond = self.pair_cond_proj(pair_norm)
+        pair_cond = pair_cond + self.pair_trans0(pair_cond)
+        return pair_cond + self.pair_trans1(pair_cond)
+
     def compute_static(
         self,
         single_emb: torch.Tensor,  # [B?, N, c_single_in]
@@ -795,12 +823,14 @@ class DiffusionConditioningBlock(nn.Module):
         ``pair_cond`` is final and constant across noise samples; the noise
         embedding is added to ``single_cond_pre_noise`` in :meth:`add_noise`.
         """
-        # Pair cond
-        pair_in = torch.cat([pair_emb, rel_feat], dim=-1)
-        pair_norm = layer_norm(pair_in, [pair_in.shape[-1]]) * self.pair_cond_norm_w
-        pair_cond = self.pair_cond_proj(pair_norm)
-        pair_cond = pair_cond + self.pair_trans0(pair_cond)
-        pair_cond = pair_cond + self.pair_trans1(pair_cond)
+        # Pair cond, row-chunked under the pair budget. The widest intermediates are
+        # the concatenated input and the transitions' SwiGLU input; the sampler runs
+        # in fp32 (``skip_amp_sample``), where the latter is 25 GiB at N=2560.
+        widest = max(
+            4 * (pair_emb.shape[-1] + rel_feat.shape[-1]),
+            2 * self.num_intermediate_factor * self.pair_cond_proj.out_features * gemm_itemsize(pair_emb),
+        )
+        pair_cond = map_pair_rows(self._pair_cond, pair_emb, self.pair_chunk_budget, widest, rel_feat)
 
         # Single cond (without noise)
         single_in = torch.cat([single_emb, target_feat], dim=-1) if self.use_trunk_single else target_feat
@@ -887,6 +917,7 @@ class DiffusionHead(nn.Module):
             c_trunk_single=c_single,
             c_trunk_pair=cfg.conditioning_pair_channel,
         )
+        self.atom_encoder.pair_chunk_budget = optim.pair_chunk_budget_bytes if optim is not None else 0
 
         # Project trunk single to diffusion act (scale-only LN + no-bias projection)
         # AF3: single_cond_embedding_projection uses final_init (zeros)

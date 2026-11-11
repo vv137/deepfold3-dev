@@ -86,29 +86,3 @@ def test_every_chunk_has_one_shape():
         out = map_row_chunks(fn, x, 3)
     assert calls == [3, 3, 3]
     assert torch.equal(out, x * 2)
-
-
-@pytest.mark.parametrize("chunk", [1, 4])
-def test_pair_transition_chunked_equals_whole(chunk):
-    """``pair_row_chunk`` evaluates the pair transition row-block by row-block."""
-    from deepfold3.model.evoformer import PairFormerBlock
-
-    whole = _randomize(PairFormerBlock(c_pair=C_PAIR, c_single=32, optim=OptimConfig()))
-    rows = PairFormerBlock(c_pair=C_PAIR, c_single=32, optim=OptimConfig(pair_row_chunk=chunk)).eval()
-    rows.load_state_dict(whole.state_dict())
-    assert rows.pair_row_chunk == chunk
-    torch.manual_seed(2)
-    pair = torch.randn(1, N, N, C_PAIR)
-    single = torch.randn(1, N, 32)
-    pair_mask = torch.ones(1, N, N, dtype=torch.bool)
-    seq_mask = torch.ones(1, N, dtype=torch.bool)
-    with torch.no_grad():
-        a = whole(pair, single, pair_mask, seq_mask)
-        b = rows(pair, single, pair_mask, seq_mask)
-    for x, y in zip(a, b, strict=True):
-        assert torch.allclose(x, y, atol=1e-5)
-
-
-def test_inference_preset_chunks_the_pair_transition():
-    assert OptimConfig.inference().pair_row_chunk > 0
-    assert OptimConfig().pair_row_chunk == 0
