@@ -216,10 +216,15 @@ class ConfidenceHead(nn.Module):
         else:
             n_arange = torch.arange(N, device=device)
 
-        plddt_list = []
-        pae_list = []
-        pde_list = []
-        exp_resolved_list = []
+        # Sample-axis position in the outputs: dim 0 unbatched, dim 1 batched
+        # (the convention ``[B?, num_samples, N, ...]``).
+        stack_dim = 1 if has_batch else 0
+        # Inference writes each sample straight into a preallocated output. A
+        # per-sample list followed by ``torch.stack`` holds the PAE and PDE
+        # ``[N, N, 64]`` maps twice at the end (~31 GiB fp32 at N=2560, 5 samples);
+        # this holds them once. With grad enabled the list + stack path is kept.
+        prealloc = not torch.is_grad_enabled()
+        outs: list[list[torch.Tensor] | torch.Tensor] = [[], [], [], []]
 
         use_ckpt = torch.is_grad_enabled()
         for s in range(num_samples):
@@ -231,7 +236,7 @@ class ConfidenceHead(nn.Module):
                 positions = atom_positions[s, n_arange, rep_atom_index]
 
             if use_ckpt:
-                plddt, exp_res, pae, pde = torch_checkpoint(
+                sample_out = torch_checkpoint(
                     self._process_one_sample,
                     pair,
                     single,
@@ -242,7 +247,7 @@ class ConfidenceHead(nn.Module):
                     return_pre_logits,
                 )
             else:
-                plddt, exp_res, pae, pde = self._process_one_sample(
+                sample_out = self._process_one_sample(
                     pair,
                     single,
                     target_feat,
@@ -252,24 +257,27 @@ class ConfidenceHead(nn.Module):
                     return_pre_logits,
                 )
 
-            plddt_list.append(plddt)
-            exp_resolved_list.append(exp_res)
-            pae_list.append(pae)
-            pde_list.append(pde)
+            for k, x in enumerate(sample_out):
+                if not prealloc:
+                    outs[k].append(x)
+                    continue
+                if s == 0:
+                    shape = list(x.shape)
+                    shape.insert(stack_dim, num_samples)
+                    outs[k] = x.new_empty(shape)
+                outs[k].select(stack_dim, s).copy_(x)
+            del sample_out, x
 
-        # Stack along the sample axis: dim=0 unbatched, dim=1 batched
-        # (so the output preserves the convention ``[B?, num_samples, N, ...]``).
-        stack_dim = 1 if has_batch else 0
-        result = {
-            "plddt_logits": torch.stack(plddt_list, dim=stack_dim),
-            "exp_resolved_logits": torch.stack(exp_resolved_list, dim=stack_dim),
-        }
+        if not prealloc:
+            outs = [torch.stack(xs, dim=stack_dim) for xs in outs]
+        plddt, exp_res, pae, pde = outs
+        result = {"plddt_logits": plddt, "exp_resolved_logits": exp_res}
         if return_pre_logits:
-            result["pae_features"] = torch.stack(pae_list, dim=stack_dim)
-            result["pde_features"] = torch.stack(pde_list, dim=stack_dim)
+            result["pae_features"] = pae
+            result["pde_features"] = pde
         else:
-            result["pae_logits"] = torch.stack(pae_list, dim=stack_dim)
-            result["pde_logits"] = torch.stack(pde_list, dim=stack_dim)
+            result["pae_logits"] = pae
+            result["pde_logits"] = pde
         return result
 
     def _process_one_sample(

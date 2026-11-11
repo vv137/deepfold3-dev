@@ -76,3 +76,17 @@ def test_layer_checkpoint_matches_and_recomputes_per_layer():
 def test_flag_follows_optim_config():
     assert _head(ckpt=True)._grad_checkpoint
     assert not _head(ckpt=False)._grad_checkpoint
+
+
+def test_inference_preallocated_outputs_match_the_stacked_ones():
+    """No grad: outputs are written into one preallocated tensor, same values and shapes."""
+    head = _head(ckpt=False).eval()
+    x = _inputs()
+    with torch.no_grad():
+        pre = head(**x)
+    with torch.enable_grad():
+        stacked = head(**x)
+    assert set(pre) == set(stacked)
+    for k in pre:
+        assert pre[k].shape == stacked[k].shape and pre[k].shape[0] == S
+        torch.testing.assert_close(pre[k], stacked[k].detach())
