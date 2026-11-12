@@ -46,10 +46,13 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import external_sets  # sibling script
 import make_pred_ref  # sibling script
 
 REPO = Path(__file__).resolve().parents[2]
-BENCH = REPO / "bench"
+# DF3_BENCH points a clean checkout at an existing bench tree (runs/, data/),
+# so a result can be re-derived from a known commit without copying the data.
+BENCH = make_pred_ref.BENCH
 GT_ROOT = BENCH / "data" / "ground_truths"
 TARGETS_ROOT = BENCH / "data" / "targets"
 
@@ -104,7 +107,10 @@ INTERFACE_CATEGORIES = {
     "interface_protein_dna",
     "interface_protein_rna",
     "interface_protein_peptide",
+    *external_sets.SETS,  # 2026ARK-AB and PXM-2025: see external_sets.py
 }
+# Trimmed ground truths for the external sets (only the chains the model has).
+TRIMMED_GT_ROOT = BENCH / "data" / "ground_truths_trimmed"
 DOCKQ_SUCCESS = 0.23
 
 
@@ -184,18 +190,25 @@ def _reference_without_chain(ref: Path, res_name: str, seq_num: int) -> Path | N
     return cache
 
 
-def run_ost(model: Path, ref: Path, out_json: Path, force: bool = False) -> None:
+def run_ost(model: Path, ref: Path, out_json: Path, force: bool = False, extra: list[str] | None = None) -> None:
+    """Score ``model`` against ``ref`` into ``out_json`` (cached unless ``force``).
+
+    ``extra`` is appended to the OST flags; the external sets pass their explicit
+    chain mapping (``-c ref:model ...``) through it. The SEQRES rescue below is
+    not used with ``extra``: it drops a reference chain, which a fixed mapping
+    may name.
+    """
     if out_json.exists() and not force:
         return
     out_json.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [*_ost_cmd(), "-m", str(model), "-r", str(ref), "-o", str(out_json), *STRUCT_FLAGS]
+    cmd = [*_ost_cmd(), "-m", str(model), "-r", str(ref), "-o", str(out_json), *STRUCT_FLAGS, *(extra or [])]
     subprocess.run(cmd, capture_output=True, check=False)
 
     try:
         d = json.load(open(out_json))
     except (FileNotFoundError, json.JSONDecodeError):
         return
-    if d.get("status") == "SUCCESS":
+    if d.get("status") == "SUCCESS" or extra:
         return
     hit = _offending_residue(str(d.get("exception") or d.get("traceback") or ""))
     if hit is None:
@@ -247,7 +260,9 @@ def parse_interface(d: dict, ic1: str, ic2: str) -> dict:
 
 
 def load_interfaces(category: str) -> dict[str, list[tuple[str, str]]]:
-    """pdb_id -> [(interface_chain_id_1, interface_chain_id_2), ...]."""
+    """pdb_id -> [(interface_chain_id_1, interface_chain_id_2), ...] in reference chain names."""
+    if category in external_sets.SETS:
+        return external_sets.interfaces(category)
     out: dict[str, list[tuple[str, str]]] = {}
     for r in csv.DictReader(open(TARGETS_ROOT / f"{category}.csv")):
         out.setdefault(r["pdb_id"], []).append((r["interface_chain_id_1"], r["interface_chain_id_2"]))
@@ -325,6 +340,44 @@ def conf_pick(rs: list[dict], key: str):
     return sum(tied) / len(tied)
 
 
+def write_provenance(eval_dir: Path, category: str) -> None:
+    """``provenance.json``: what produced this eval dir, so it can be re-derived.
+
+    Records the code commit (and whether the tree was dirty), the OST command
+    and version, the flags, and for the external sets the sha256 of the CSVs
+    that define chains and interfaces.
+    """
+
+    def git(*args):
+        try:
+            return subprocess.run(["git", "-C", str(REPO), *args], capture_output=True, text=True).stdout.strip()
+        except OSError:
+            return None
+
+    try:
+        ver = subprocess.run([*_ost_cmd()[:-1], "--version"], capture_output=True, text=True)
+        ost_version = (ver.stdout or ver.stderr).strip().splitlines()[-1]
+    except (OSError, IndexError):
+        ost_version = None
+    prov = {
+        "commit": git("rev-parse", "HEAD"),
+        "dirty": bool(git("status", "--porcelain", "--", "bench/scripts")),
+        "bench": str(BENCH),
+        "ost_cmd": _ost_cmd(),
+        "ost_version": ost_version,
+        "struct_flags": STRUCT_FLAGS,
+    }
+    if category in external_sets.SETS:
+        root = external_sets.set_dir(category)
+        prov["external_set"] = {
+            "dir": str(root),
+            "reference": "ground truth trimmed to chain_map.csv chains; explicit -c chain mapping",
+            "trimmed_gt_root": str(TRIMMED_GT_ROOT / category),
+            "sha256": {f: external_sets.sha256(root / f) for f in ("targets.csv", "chain_map.csv", "interfaces.csv")},
+        }
+    json.dump(prov, open(eval_dir / "provenance.json", "w"), indent=1)
+
+
 def evaluate(series: str, step: int, category: str, workers: int, force: bool = False) -> None:
     is_interface = category in INTERFACE_CATEGORIES
     eval_dir = BENCH / "runs" / series / "eval" / category / f"step_{step}"
@@ -338,10 +391,19 @@ def evaluate(series: str, step: int, category: str, workers: int, force: bool = 
         return
 
     # 1. run OST per prediction (subprocess => threads fine), cached
+    external = category in external_sets.SETS
+
     def job(r):
         out = detail / f"{r['pdb_id']}_{r['seed']}_{r['sample']}_structure_ost.json"
-        run_ost(Path(r["prediction_path"]), GT_ROOT / f"{r['pdb_id']}.cif", out, force=force)
+        if external:
+            ref = external_sets.trimmed_reference(category, r["pdb_id"], TRIMMED_GT_ROOT)
+            extra = external_sets.chain_mapping_args(category, r["pdb_id"])
+        else:
+            ref, extra = GT_ROOT / f"{r['pdb_id']}.cif", None
+        run_ost(Path(r["prediction_path"]), ref, out, force=force, extra=extra)
         return r, out
+
+    write_provenance(eval_dir, category)
 
     print(f"[eval] {len(rows)} OST comparisons on {workers} workers ({'interface' if is_interface else 'monomer'}) ...")
     parsed = []
