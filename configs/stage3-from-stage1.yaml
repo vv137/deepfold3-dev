@@ -1,0 +1,37 @@
+base: stage3.yaml
+
+# Stage 3 from stage1 — the stage3 recipe started from stage1-120000 instead of
+# stage2-50000, without conditioning dropout. Crop, LR schedule and losses are
+# stage3.yaml's; only the dropout settings below differ.
+#
+# Weights: the stage1-120000 EMA shadow, which is what the stage1 benchmarks
+# evaluated (fb.sbatch runs inference with --snapshot shadow):
+#   deepfold3 export --checkpoint /scratch/t529a02/deepfold3/checkpoint_120000.pt \
+#       --output /scratch/t529a02/deepfold3/runs/stage1-120000-shadow.safetensors \
+#       --snapshot shadow
+#   --params .../stage1-120000-shadow.safetensors
+# The export has the same tensor names and shapes as stage2-50000-shadow; its
+# stored ModelConfig differs only in conditioning dropout and optim flags.
+#
+# No conditioning dropout: stage1 never trained with it, so this run keeps
+# stage1's setting (every forward conditioned) and continues the stage1 line at
+# the stage3 crop. The checkpoint therefore does NOT support classifier-free
+# guidance; benchmark it unguided. Against df3-stage3-001 the runs differ in the
+# initial weights and in dropout, not only the weights.
+#
+# stage1 trained at 512 tokens / 6912 atoms with grad accumulation 2; stage3 is
+# 640 / 8640 with accumulation 1. stage2 had the same 512 crop, so the jump is
+# the same for both runs.
+#
+# Submit (same flags as df3-stage3-001 apart from --params):
+#   CONFIG_SRC=configs/stage3-from-stage1.yaml LINKS=2 \
+#   EXTRA_ARGS="--params /scratch/t529a02/deepfold3/runs/stage1-120000-shadow.safetensors \
+#       --seed 303 --grad-accum 1 --wandb deepfold3-stage3 --wandb-entity DeepFoldProtein \
+#       --override diffusion_chunk_size=4" \
+#   bash hangang/submit.sh stage3-s1-001
+
+model:
+  diffusion:
+    # stage1's values (no trunk-pair conditioning dropout); see above.
+    use_conditioning_prob: 1.0
+    cond_drop_interface_frac: 0.0
