@@ -168,6 +168,15 @@ see `memory/project_stage1_crop640`.)
   resolve to the RCSB copy label `B-2` by the same rule as the set's `verify_mapping.py`.
   Against the full assembly the interface DockQ is unchanged but global lDDT/TM fall
   (9qrv sample: lDDT 0.85 → 0.64).
+- **8 PXM-2025 PPI targets never score** (13 of 882 interfaces; same at every checkpoint, so
+  cross-checkpoint comparisons are unaffected). OST cannot score them under the explicit mapping:
+  - `8u8e`, `9dlp`, `9dlv`: the scored partner chain holds `A1AMM`, which OST's compound library
+    does not know (SEQRES mismatch). The FoldBench rescue would drop exactly that chain.
+  - `9kkq`, `9kmn`: the partner chain is all `UNK` in the ground truth, so OST cannot chem-group it.
+  - `9bj5`, `9cd2`, `9r2z`: two copies of one protein that the PDB splits into two entities
+    (a methyl-lysine at different positions, or one extra N-terminal Met). The model chains are
+    identical, so OST puts both in one chem group and rejects the mapping. Automatic mapping
+    "succeeds" but maps only one chain, so the interface has no DockQ either.
 - **Re-deriving a result.** Every eval dir gets `provenance.json` (commit, dirty flag, OST
   command and version, flags, and the external-set CSV hashes). `DF3_BENCH=<bench tree>` runs a
   clean checkout's scripts against an existing `runs/` and `data/`, e.g.
