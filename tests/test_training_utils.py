@@ -713,6 +713,59 @@ class TestCheckpointResume:
         assert new_state.effective_step == 1300
         assert new_state.epoch == 1300 // 391  # == 3
 
+    @pytest.mark.parametrize("apply_skip_flags", [True, False])
+    def test_skip_flags_only_when_applied(self, tmp_path, apply_skip_flags):
+        """skip_load_* reset step/optimizer/scheduler only when applied.
+
+        Auto-resume from the run's own directory passes
+        ``apply_skip_flags=False`` so a stage config that starts fresh
+        (stage3.yaml) does not restart every chain link at step 0.
+        """
+        import dataclasses
+
+        from deepfold3.training.state import TrainState
+
+        cfg, model_cfg, model, optimizer, scheduler, state, ckpt_mgr, dist_info = self._make_world(tmp_path)
+        for _ in range(5):
+            optimizer.step()
+            scheduler.step()
+        path = tmp_path / "ckpt.pt"
+        ckpt_mgr.save(
+            path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            ema=None,
+            scaler=None,
+            state=state,
+            model_cfg=model_cfg,
+            train_cfg=cfg,
+            dist_info=dist_info,
+        )
+        skip_cfg = dataclasses.replace(cfg, skip_load_optimizer=True, skip_load_scheduler=True, skip_load_step=True)
+        _, _, model2, optimizer2, scheduler2, _, _, _ = self._make_world(tmp_path)
+        new_state = TrainState()
+        ckpt_mgr.load(
+            path,
+            model=model2,
+            optimizer=optimizer2,
+            scheduler=scheduler2,
+            ema=None,
+            scaler=None,
+            state=new_state,
+            train_cfg=skip_cfg,
+            dist_info=dist_info,
+            apply_skip_flags=apply_skip_flags,
+        )
+        if apply_skip_flags:
+            assert new_state.effective_step == 0
+            assert scheduler2.last_epoch == 0
+        else:
+            assert new_state.effective_step == 100
+            assert new_state.global_step == 200
+            assert scheduler2.last_epoch == scheduler.last_epoch == 5
+            assert optimizer2.state_dict()["state"].keys() == optimizer.state_dict()["state"].keys()
+
     def test_sampler_iter_position_round_trip(self, tmp_path):
         """Sampler ``sample_idx`` is captured + restored, so resume yields the tail.
 

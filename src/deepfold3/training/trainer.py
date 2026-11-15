@@ -498,7 +498,7 @@ class Trainer:
     def _find_latest_checkpoint(output_dir: Path) -> Path | None:
         return CheckpointManager.find_latest(output_dir)
 
-    def _load_checkpoint(self, path: Path) -> None:
+    def _load_checkpoint(self, path: Path, *, apply_skip_flags: bool = True) -> None:
         """Load checkpoint via :class:`CheckpointManager`.
 
         Computes ``steps_per_epoch`` and ``samples_per_step_per_rank``
@@ -525,6 +525,7 @@ class Trainer:
             steps_per_epoch=steps_per_epoch,
             train_sampler=self._train_sampler,
             samples_per_step_per_rank=samples_per_step_per_rank,
+            apply_skip_flags=apply_skip_flags,
         )
 
     # ------------------------------------------------------------------
@@ -582,7 +583,16 @@ class Trainer:
         elif self.cfg.auto_resume:
             latest = self._find_latest_checkpoint(output_dir)
             if latest is not None:
-                self._load_checkpoint(latest)
+                # The run's own checkpoint: always restore the full state.
+                # skip_load_* start a new stage fresh; applied here they
+                # would restart every chain link at step 0 with a new
+                # optimizer and LR warmup (df3-stage3-001, 2026-11-15).
+                skipped = [
+                    f for f in ("skip_load_optimizer", "skip_load_scheduler", "skip_load_step") if getattr(self.cfg, f)
+                ]
+                if skipped:
+                    rank_zero_info(f"[resume] auto-resume from own run dir: ignoring {', '.join(skipped)}")
+                self._load_checkpoint(latest, apply_skip_flags=False)
                 resumed = True
 
         # Resume LR override: optimizer.load_state_dict and

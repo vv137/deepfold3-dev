@@ -729,7 +729,7 @@ Resume training by passing `--resume path/to/checkpoint.pt`.
 
 **Resume audit (warn-only)**: every other yaml-controlled field that is silently shadowed by saved state — `weight_decay` (per param-group), Adam `betas` / `eps`, `ema_decay`, `wsds_decay_windows` — is compared against the live config and logged as `[resume] yaml fields silently shadowed by checkpoint state` when divergent. The audit is read-only. Fix the yaml or accept the saved value (most fields can also be re-injected via `--override`).
 
-**Partial loading** for stage transitions: use `--params` with a previous stage's checkpoint plus config overrides. Control what gets loaded via `load_strict` (default true), `skip_load_optimizer`, `skip_load_scheduler`, `skip_load_step`.
+**Partial loading** for stage transitions: use `--params` with a previous stage's checkpoint plus config overrides. `--params` loads weights only. `skip_load_optimizer`, `skip_load_scheduler` and `skip_load_step` apply to an explicit `--resume` from another run's `.pt`; `load_strict` (default true) applies to both. **Auto-resume from the run's own output dir ignores the `skip_load_*` flags** and restores the full state (logged as `[resume] auto-resume from own run dir: ignoring …`). Before that, a stage config that sets them (`stage3.yaml`, `stage2-frozen-trunk.yaml`, `finetune3_confidence.yaml`) restarted every chain link at step 0 with a new optimizer and LR warmup (df3-stage3-001 link 2, 2026-11-15).
 
 **Post-write I/O** runs on a single background thread (`max_workers=1`), drained by `wait_for_io` before the next save and at shutdown:
 

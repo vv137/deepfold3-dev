@@ -358,12 +358,17 @@ class CheckpointManager:
         steps_per_epoch: int | None = None,
         train_sampler: object | None = None,
         samples_per_step_per_rank: int = 1,
+        apply_skip_flags: bool = True,
     ) -> None:
         """Resume training state from ``path``, mutating the live objects in place.
 
         Handles DDP ``module.`` prefix stripping automatically.
         Partial-load gates (``skip_load_optimizer`` / ``skip_load_scheduler`` /
-        ``skip_load_step``) follow the training config.
+        ``skip_load_step``) follow the training config when
+        ``apply_skip_flags`` is true. The trainer passes ``False`` when it
+        auto-resumes from the run's own output directory: those flags start a
+        new stage fresh, and applying them to the run's own checkpoint would
+        restart every chain link at step 0 with a new optimizer and warmup.
 
         If the checkpoint includes per-rank ``rng_states``, each rank's
         slot is scattered back to it; otherwise RNGs are left at the
@@ -388,7 +393,11 @@ class CheckpointManager:
             state_dict = {k.removeprefix("module."): v for k, v in state_dict.items()}
         model.load_state_dict(state_dict, strict=self.strict)
 
-        if "optimizer" in ckpt and not train_cfg.skip_load_optimizer:
+        skip_optimizer = apply_skip_flags and train_cfg.skip_load_optimizer
+        skip_scheduler = apply_skip_flags and train_cfg.skip_load_scheduler
+        skip_step = apply_skip_flags and train_cfg.skip_load_step
+
+        if "optimizer" in ckpt and not skip_optimizer:
             # G5 invariant: SF saves with ``train_mode=False`` so the live
             # params loaded from ``ckpt["model"]`` are ``x``. The follow-up
             # ``optimizer.train()`` then lerps ``x → y``. If the saved
@@ -412,7 +421,7 @@ class CheckpointManager:
         # so a checkpoint pre-dating the eval-on-save behavior is handled.
         if hasattr(optimizer, "eval_mode"):
             optimizer.train()
-        if "scheduler" in ckpt and not train_cfg.skip_load_scheduler:
+        if "scheduler" in ckpt and not skip_scheduler:
             scheduler.load_state_dict(ckpt["scheduler"])
         if "ema" in ckpt and ema is not None:
             ema.load_state_dict(ckpt["ema"])
@@ -425,7 +434,7 @@ class CheckpointManager:
                     "(scale will be re-estimated, may cause skipped steps early on)."
                 )
 
-        if not train_cfg.skip_load_step:
+        if not skip_step:
             state.global_step = ckpt.get("global_step", 0)
             state.effective_step = ckpt.get("effective_step", 0)
             if "epoch" in ckpt:
