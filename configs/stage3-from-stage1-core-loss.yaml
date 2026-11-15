@@ -1,0 +1,24 @@
+base: stage3-from-stage1.yaml
+
+# Stage 3 from stage1 with only the core losses: diffusion MSE, bond,
+# distogram and the confidence head (pLDDT / PDE / resolved + PAE). Everything
+# else is stage3-from-stage1.yaml's: stage1-120000 shadow weights, no
+# conditioning dropout, the 640-token / 8640-atom crop, 48 noise levels and the
+# 1k warmup / 2k peak / 2k linear decay to step 5000.
+#
+# Off here, on in stage1/stage3:
+#   smooth lDDT (alpha_smooth_lddt 1.0): null skips the term entirely rather
+#     than computing it at weight 0 (loss.py checks `is not None`).
+#   shape complementarity (alpha_shape_comp 0.03).
+# Against stage3-s1-001 the run differs only in these two loss terms.
+#
+# Submit (same flags as stage3-s1-001 apart from the seed):
+#   CONFIG_SRC=configs/stage3-from-stage1-core-loss.yaml LINKS=2 \
+#   EXTRA_ARGS="--params /scratch/t529a02/deepfold3/runs/stage1-120000-shadow.safetensors \
+#       --seed 505 --grad-accum 1 --wandb deepfold3-stage3 --wandb-entity DeepFoldProtein \
+#       --override diffusion_chunk_size=4" \
+#   bash hangang/submit.sh stage3-s1-core-001
+
+training:
+  alpha_smooth_lddt: null
+  alpha_shape_comp: 0.0
