@@ -9,8 +9,8 @@
 #   CONFIG_SRC=configs/df3-stage0-r12.yaml bash hangang/submit.sh my-r12
 #
 # Each link starts when the previous one ends for any reason (afterany) and
-# resumes from the newest checkpoint in $RUNS/<run>. The queue allows 5
-# active jobs per user, so LINKS <= 5; re-run this script to extend a chain
+# resumes from the newest checkpoint in $RUNS/<run>. Partition normal allows
+# 5 jobs per user, pending included, so LINKS <= 5; re-run this script to extend a chain
 # (it waits on the last queued link of the same name).
 
 set -euo pipefail
