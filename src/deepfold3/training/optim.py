@@ -598,9 +598,6 @@ class WrappedOptimizer:
         """
         self.scaler.unscale_(self.optimizer)
 
-        if self._null_pair is not None and self._null_pair.grad is not None:
-            # Already all-reduced here unless per-rank clip (then this rank's own).
-            state.last_null_pair_grad_norm = self._null_pair.grad.detach().float().norm()
         clip = self.cfg.grad_clip_norm if self.cfg.grad_clip_norm > 0 else float("inf")
         if self.cfg.grad_norm_fp64:
             grad_norm = _clip_grad_norm_fp64(self.model.parameters(), clip).detach()
@@ -614,6 +611,11 @@ class WrappedOptimizer:
             # extra param sweep is needed. Outside per-rank mode the field
             # stays at its ``None`` default (never read by the trainer).
             state.last_grad_norm_global = _all_reduce_grads_(self.model.parameters(), self.dist.world_size).detach()
+        if self._null_pair is not None and self._null_pair.grad is not None:
+            # The gradient the optimizer steps on: clipped, and averaged over
+            # ranks (DDP's all-reduce, or the manual one above in per-rank-clip
+            # mode), so it is the same on every rank.
+            state.last_null_pair_grad_norm = self._null_pair.grad.detach().float().norm()
         return grad_norm
 
     def step_or_skip(self, state: TrainState) -> StepResult:

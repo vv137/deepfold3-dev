@@ -62,8 +62,8 @@ class TrainState:
     last_grad_norm_global: torch.Tensor | None = None
     last_grad_norm_rank_mean: torch.Tensor | None = None
     last_grad_norm_rank_max: torch.Tensor | None = None
-    # Pre-clip grad norm of ``diffusion_head.null_pair`` (``cond_drop_fill:
-    # learned``); None when the model has no such parameter.
+    # Norm of the gradient the optimizer applies to ``diffusion_head.null_pair``
+    # (clipped, rank-averaged; ``cond_drop_fill: learned``); None without it.
     last_null_pair_grad_norm: torch.Tensor | None = None
     last_num_recycles: int = 0
 
