@@ -170,9 +170,15 @@ def _run_one_job(
     restraint_after_step: bool = False,
     restraint_after_sigma: float = 16.0,
     manifest_fields: dict | None = None,
+    sweep: list[tuple[str, Path, tuple]] | None = None,
 ) -> None:
     """Featurize + forward + save for a single JSON job. Mirrors the JSON
     branch of ``inference``.
+
+    ``sweep`` lists ``(name, output_dir, guidance_specs)`` entries that replace
+    ``output_dir`` / ``guidance_specs``: the trunk runs once per seed and every
+    entry samples from it, re-seeded, so each entry is what a separate run with
+    that guidance would give (the trunk does not depend on guidance).
 
     ``seeds`` is the CLI-provided seed list; when empty each JSON's own
     ``modelSeeds`` are used. Every seed is folded independently and written to
@@ -182,13 +188,7 @@ def _run_one_job(
     exists is skipped (per-seed resume)."""
     from deepfold3.data.module.dataset import InferenceInput
     from deepfold3.data.parse.json_input import describe_msa_pairing, parse_json_input
-    from deepfold3.io.confidences import (
-        save_confidences_json,
-        save_distogram_logits,
-        save_ranking_scores_csv,
-        save_summary_confidences_json,
-    )
-    from deepfold3.io.mmcif import save_mmcif
+    from deepfold3.io.confidences import save_ranking_scores_csv, save_summary_confidences_json
 
     click.echo(f"[batch] featurizing {json_input} …")
     t0 = time.perf_counter()
@@ -247,15 +247,18 @@ def _run_one_job(
 
     feats = {k: v.to(dev) for k, v in feats.items()}
 
-    guidance_terms = None
-    if guidance_specs:
+    entries = sweep if sweep is not None else [("", output_dir, guidance_specs)]
+
+    def _terms(specs: tuple):
+        if not specs:
+            return None
         from deepfold3.io.mmcif import resolve_chain_name as _resolve
         from deepfold3.model.guidance import build_guidance_terms
 
         chain_index = {_resolve(a, chain_names): a for a in feats["asym_id"][:original_n].unique().tolist()}
         try:
-            guidance_terms = build_guidance_terms(
-                guidance_specs,
+            return build_guidance_terms(
+                specs,
                 feats["asym_id"],
                 chain_index,
                 original_n,
@@ -264,6 +267,8 @@ def _run_one_job(
             )
         except ValueError as e:
             raise click.ClickException(f"--guidance on {json_input.name}: {e}") from e
+
+    entry_terms = [_terms(specs) for _, _, specs in entries]
 
     restraints = ()
     if restraint_specs:  # already merged by the command below
@@ -287,39 +292,49 @@ def _run_one_job(
     # preserving order.
     seed_list = list(dict.fromkeys(seeds)) if seeds else json_seeds
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    # One manifest per job: a sweep's outputs then say for themselves which
-    # weights, code and flags produced them.
-    manifest_path = output_dir / "run_manifest.json"
-    manifest = new_manifest(
-        json_input=str(json_input),
-        seeds=[int(x) for x in seed_list],
-        num_tokens=original_n,
-        padded_tokens=feats["res_type"].shape[0],
-        msa_rows=S,
-        msa_pairing={"requested": msa_pairing, "resolved": job.msa_pairing},
-        guidance=[{**dataclasses.asdict(g), "description": _describe_guidance(g)} for g in guidance_specs],
-        restraints=[
-            {**dataclasses.asdict(r), "description": describe_restraint(r), "weight": restraint_weight}
-            for r in restraint_specs
-        ],
-        precision=precision,
-        **(manifest_fields or {}),
-    )
-    write_manifest(manifest_path, manifest)
+    # One manifest per entry: a sweep's outputs then say for themselves which
+    # weights, code and flags produced them. A job restricted to some seeds
+    # (an inputs-file ``seeds=`` column) shares its directory with jobs running
+    # the other seeds, so its manifest is per seed.
+    manifest_name = "run_manifest.json"
+    if seeds and sweep is not None and len(seed_list) == 1:
+        manifest_name = f"run_manifest.seed-{int(seed_list[0])}.json"
+    manifests = []
+    for _, od, specs in entries:
+        od.mkdir(parents=True, exist_ok=True)
+        m = new_manifest(
+            json_input=str(json_input),
+            seeds=[int(x) for x in seed_list],
+            num_tokens=original_n,
+            padded_tokens=feats["res_type"].shape[0],
+            msa_rows=S,
+            msa_pairing={"requested": msa_pairing, "resolved": job.msa_pairing},
+            guidance=[{**dataclasses.asdict(g), "description": _describe_guidance(g)} for g in specs],
+            restraints=[
+                {**dataclasses.asdict(r), "description": describe_restraint(r), "weight": restraint_weight}
+                for r in restraint_specs
+            ],
+            precision=precision,
+            **(manifest_fields or {}),
+        )
+        write_manifest(od / manifest_name, m)
+        manifests.append(m)
     kernel_census.reset_counts()
 
-    summaries: list[dict] = []
+    summaries: list[list[dict]] = [[] for _ in entries]
 
     for current_seed in seed_list:
         # Judge a seed on every file it owes, not just model.cif: a run killed
         # between the structure and its confidences would otherwise be "done"
         # with the rest missing for good.
-        if skip_existing and all(
-            p.exists() for p in _seed_outputs(output_dir, current_seed, num_samples, save_distogram)
-        ):
-            click.echo(f"[batch]   seed {current_seed}: complete — skip")
-            summaries += _existing_summaries(output_dir, current_seed, num_samples)
+        todo = []
+        for k, (name, od, _) in enumerate(entries):
+            if skip_existing and all(p.exists() for p in _seed_outputs(od, current_seed, num_samples, save_distogram)):
+                click.echo(f"[batch]   {name + ' ' if name else ''}seed {current_seed}: complete — skip")
+                summaries[k] += _existing_summaries(od, current_seed, num_samples)
+            else:
+                todo.append(k)
+        if not todo:
             continue
         click.echo(f"[batch] {json_input.name}  seed={current_seed} samples={num_samples} recycles={num_recycles}")
         t0 = time.perf_counter()
@@ -327,80 +342,151 @@ def _run_one_job(
             torch.inference_mode(),
             torch.autocast(feats["res_type"].device.type, dtype=torch.bfloat16, enabled=precision == "bf16"),
         ):
-            model_output = model(
-                feats,
-                seed=current_seed,
-                num_recycles=num_recycles,
-                num_samples=num_samples,
-                guidance_terms=guidance_terms,
-                restraints=restraints,
-                restraint_weight=restraint_weight,
-                restraint_rigid=restraint_rigid,
-                restraint_max_step=restraint_max_step,
-                restraint_after_step=restraint_after_step,
-                restraint_after_sigma=restraint_after_sigma,
-            )
+            orig_num_samples = model.diffusion_head.cfg.num_samples
+            model.diffusion_head.cfg.num_samples = num_samples
+            try:
+                trunk = model.run_evoformer(feats, num_recycles, seed=current_seed)
+            finally:
+                model.diffusion_head.cfg.num_samples = orig_num_samples
+        if len(entries) > 1:
+            click.echo(f"  trunk {time.perf_counter() - t0:.1f}s")
+        distogram = None
+        for k in todo:
+            name, od, _ = entries[k]
+            t1 = time.perf_counter()
+            with (
+                torch.inference_mode(),
+                torch.autocast(feats["res_type"].device.type, dtype=torch.bfloat16, enabled=precision == "bf16"),
+            ):
+                model_output = model.sample_from_trunk(
+                    feats,
+                    trunk,
+                    seed=current_seed,
+                    num_samples=num_samples,
+                    guidance_terms=entry_terms[k],
+                    restraints=restraints,
+                    restraint_weight=restraint_weight,
+                    restraint_rigid=restraint_rigid,
+                    restraint_max_step=restraint_max_step,
+                    restraint_after_step=restraint_after_step,
+                    restraint_after_sigma=restraint_after_sigma,
+                    distogram=distogram,
+                )
+            distogram = model_output.distogram
 
-        iter_feats = feats
-        if use_bucket and original_n < feats["res_type"].shape[0]:
-            from deepfold3.model.bucket import unpad_features, unpad_output
+            iter_feats = feats
+            if use_bucket and original_n < feats["res_type"].shape[0]:
+                from deepfold3.model.bucket import unpad_features, unpad_output
 
-            model_output = unpad_output(model_output, original_n)
-            iter_feats = unpad_features(feats, original_n)
-        click.echo(f"  done in {time.perf_counter() - t0:.1f}s")
-
-        # Trunk distogram is shared across this seed's samples (no sample axis),
-        # so write it once per seed rather than into every sample dir.
-        if save_distogram:
-            distogram_npz = output_dir / f"seed-{int(current_seed)}_distogram.npz"
-            if save_distogram_logits(distogram_npz, model_output, scheme=logits_scheme, seed=int(current_seed)):
-                click.echo(f"  saved  {distogram_npz.name}")
-
-        for s in range(num_samples):
-            sample_dir = output_dir / f"seed-{int(current_seed)}_sample-{int(s)}"
-            sample_dir.mkdir(parents=True, exist_ok=True)
-            save_mmcif(
-                sample_dir / "model.cif",
+                model_output = unpad_output(model_output, original_n)
+                iter_feats = unpad_features(feats, original_n)
+            label = f"{name} " if name else ""
+            click.echo(f"  {label}done in {time.perf_counter() - (t1 if len(entries) > 1 else t0):.1f}s")
+            summaries[k] += _save_seed(
+                od,
                 model_output,
                 iter_feats,
+                current_seed,
+                num_samples,
+                save_distogram=save_distogram,
+                logits_scheme=logits_scheme,
+                plot_confidences=plot_confidences,
                 entity_descriptions=entity_descriptions,
-                title=job_title,
-                sample_idx=s,
+                job_title=job_title,
                 chain_names=chain_names,
             )
-            conf_path = sample_dir / "confidences.json"
-            summary = save_confidences_json(
-                conf_path,
-                model_output,
-                iter_feats,
-                sample_idx=s,
-                seed=int(current_seed),
-                chain_names=chain_names,
-            )
-            summary = {**summary, "seed": int(current_seed), "sample": int(s)}
-            summaries.append(summary)
-            if plot_confidences:
-                from deepfold3.scripts.plot_confidences import plot_confidences_file
-
-                plot_confidences_file(conf_path, conf_path.with_suffix(".png"))
-
-        # Free this seed's outputs before the next seed's forward. Otherwise
-        # ``model_output`` (PAE/PDE [S, N, N, 64] fp32, ~16 GiB at N=2560) stays
-        # alive until the next forward returns: at N=2560 the first seed fits
-        # and the second OOMs in the confidence head.
-        del model_output, iter_feats
+            # Free this entry's outputs before the next sample. Otherwise
+            # ``model_output`` (PAE/PDE [S, N, N, 64] fp32, ~16 GiB at N=2560)
+            # stays alive until the next one returns: at N=2560 the first fits
+            # and the second OOMs in the confidence head.
+            del model_output, iter_feats
+            if feats["res_type"].is_cuda:
+                torch.cuda.empty_cache()
+        del trunk, distogram
         if feats["res_type"].is_cuda:
             torch.cuda.empty_cache()
 
-    if summaries:
-        save_ranking_scores_csv(output_dir / "ranking_scores.csv", summaries)
-        summary_name = f"{job_name}_summary_confidences.json" if job_name else "summary_confidences.json"
-        save_summary_confidences_json(output_dir / summary_name, summaries, job_name=job_name)
-    manifest["status"] = "ok"
-    manifest["kernels"] = kernel_census.snapshot()
-    manifest["kernels_shadowed"] = kernel_census.shadowed()
-    manifest["kernels_inactive"] = kernel_census.inactive()
-    write_manifest(manifest_path, manifest)
+    for k, (_, od, _) in enumerate(entries):
+        if sweep is not None and seeds and len(seed_list) == 1:
+            # Other jobs hold the other seeds of this directory: list every seed on disk.
+            summaries[k] = _all_summaries_on_disk(od, num_samples)
+        if summaries[k]:
+            save_ranking_scores_csv(od / "ranking_scores.csv", summaries[k])
+            summary_name = f"{job_name}_summary_confidences.json" if job_name else "summary_confidences.json"
+            save_summary_confidences_json(od / summary_name, summaries[k], job_name=job_name)
+        manifests[k]["status"] = "ok"
+        manifests[k]["kernels"] = kernel_census.snapshot()
+        manifests[k]["kernels_shadowed"] = kernel_census.shadowed()
+        manifests[k]["kernels_inactive"] = kernel_census.inactive()
+        write_manifest(od / manifest_name, manifests[k])
+
+
+def _save_seed(
+    output_dir: Path,
+    model_output,
+    iter_feats: dict,
+    seed: int,
+    num_samples: int,
+    *,
+    save_distogram: bool,
+    logits_scheme: str,
+    plot_confidences: bool,
+    entity_descriptions,
+    job_title: str,
+    chain_names,
+) -> list[dict]:
+    """Write one seed's structures and confidences; returns the per-sample summaries."""
+    from deepfold3.io.confidences import save_confidences_json, save_distogram_logits
+    from deepfold3.io.mmcif import save_mmcif
+
+    # Trunk distogram is shared across this seed's samples (no sample axis),
+    # so write it once per seed rather than into every sample dir.
+    if save_distogram:
+        distogram_npz = output_dir / f"seed-{int(seed)}_distogram.npz"
+        if save_distogram_logits(distogram_npz, model_output, scheme=logits_scheme, seed=int(seed)):
+            click.echo(f"  saved  {distogram_npz.name}")
+
+    out = []
+    for s in range(num_samples):
+        sample_dir = output_dir / f"seed-{int(seed)}_sample-{int(s)}"
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        save_mmcif(
+            sample_dir / "model.cif",
+            model_output,
+            iter_feats,
+            entity_descriptions=entity_descriptions,
+            title=job_title,
+            sample_idx=s,
+            chain_names=chain_names,
+        )
+        conf_path = sample_dir / "confidences.json"
+        summary = save_confidences_json(
+            conf_path,
+            model_output,
+            iter_feats,
+            sample_idx=s,
+            seed=int(seed),
+            chain_names=chain_names,
+        )
+        out.append({**summary, "seed": int(seed), "sample": int(s)})
+        if plot_confidences:
+            from deepfold3.scripts.plot_confidences import plot_confidences_file
+
+            plot_confidences_file(conf_path, conf_path.with_suffix(".png"))
+    return out
+
+
+def _all_summaries_on_disk(output_dir: Path, num_samples: int) -> list[dict]:
+    """Summaries of every seed of ``output_dir`` whose samples are all written."""
+    seeds = sorted({int(p.name.split("_")[0][5:]) for p in output_dir.glob("seed-*_sample-*") if p.is_dir()})
+    out = []
+    for seed in seeds:
+        if all((output_dir / f"seed-{seed}_sample-{s}" / "confidences.json").exists() for s in range(num_samples)):
+            try:
+                out += _existing_summaries(output_dir, seed, num_samples)
+            except click.ClickException:
+                continue  # being written by another job right now
+    return out
 
 
 def _seed_outputs(output_dir: Path, seed: int, num_samples: int, save_distogram: bool) -> list[Path]:
@@ -436,17 +522,25 @@ def _existing_summaries(output_dir: Path, seed: int, num_samples: int) -> list[d
     return out
 
 
-def _parse_inputs_file(path: Path, output_template: str, params: Path) -> list[tuple[Path, Path]]:
-    """Read a TSV of ``json_path [TAB output_dir]`` lines. Returns
-    ``[(json_path, output_dir), ...]``."""
+def _parse_inputs_file(path: Path, output_template: str, params: Path) -> list[tuple[Path, Path, dict[str, str]]]:
+    """Read a TSV of ``json_path [TAB output_dir [TAB key=value ...]]`` lines.
+
+    The ``key=value`` columns are per-line options: ``seeds=42,66`` folds only
+    those seeds (overriding ``--seed``), and with ``--guidance-sweep``
+    ``group=NAME`` picks the sweep group and ``pairs=H:A,L:A`` fills its
+    ``{pairs}`` placeholder. Columns are tab-separated when the line has a tab,
+    else the line is ``json_path [output_dir]`` split on whitespace.
+
+    Returns ``[(json_path, output_dir, extras), ...]``.
+    """
     out = []
     for raw in path.read_text().splitlines():
         line = raw.split("#", 1)[0].strip()
         if not line:
             continue
-        parts = line.split(None, 1)
+        parts = [p.strip() for p in line.split("\t")] if "\t" in line else line.split(None, 1)
         json_path = Path(parts[0])
-        if len(parts) == 2:
+        if len(parts) >= 2 and parts[1]:
             output_dir = Path(parts[1])
         else:
             output_dir = Path(
@@ -457,7 +551,53 @@ def _parse_inputs_file(path: Path, output_template: str, params: Path) -> list[t
                     params_stem=params.stem,
                 )
             )
-        out.append((json_path, output_dir))
+        extras = {}
+        for col in parts[2:]:
+            key, eq, value = col.partition("=")
+            if not eq:
+                raise click.UsageError(f"{path}: expected key=value, got {col!r} in line {raw!r}")
+            extras[key] = value
+        out.append((json_path, output_dir, extras))
+    return out
+
+
+def _load_sweep(path: Path) -> dict[str, list[tuple[str, tuple[str, ...]]]]:
+    """``--guidance-sweep`` file: ``{"groups": {GROUP: [{"name": N, "guidance": [W@TARGET, ...]}, ...]}}``.
+
+    Each entry is one guidance setting; its outputs go to the line's output
+    directory with ``{cfg}`` replaced by the entry name. ``{pairs}`` in a
+    guidance value is replaced by the line's ``pairs=`` column.
+    """
+    data = json.loads(path.read_text())
+    groups = {}
+    for group, items in data["groups"].items():
+        entries = []
+        for it in items:
+            entries.append((str(it["name"]), tuple(str(g) for g in it.get("guidance", ()))))
+        names = [n for n, _ in entries]
+        if len(set(names)) != len(names):
+            raise click.UsageError(f"--guidance-sweep: duplicate entry names in group {group!r}")
+        groups[group] = entries
+    return groups
+
+
+def _sweep_entries(
+    groups: dict[str, list[tuple[str, tuple[str, ...]]]], output_dir: Path, extras: dict[str, str]
+) -> list[tuple[str, Path, tuple]]:
+    """The ``(name, output_dir, guidance_specs)`` entries one inputs-file line runs."""
+    from deepfold3.model.guidance import parse_guidance_spec
+
+    group = extras.get("group")
+    if group not in groups:
+        raise click.UsageError(f"--guidance-sweep: line {output_dir} has group={group!r}; known: {sorted(groups)}")
+    if "{cfg}" not in str(output_dir):
+        raise click.UsageError(f"--guidance-sweep: output dir {output_dir} has no {{cfg}} placeholder")
+    out = []
+    for name, texts in groups[group]:
+        if any("{pairs}" in t for t in texts) and not extras.get("pairs"):
+            raise click.UsageError(f"--guidance-sweep: entry {name!r} needs pairs= on line {output_dir}")
+        specs = tuple(parse_guidance_spec(t.replace("{pairs}", extras.get("pairs", ""))) for t in texts)
+        out.append((name, Path(str(output_dir).replace("{cfg}", name)), specs))
     return out
 
 
@@ -588,6 +728,16 @@ def _parse_inputs_file(path: Path, output_template: str, params: Path) -> list[t
     help="Classifier-free guidance term, as ``inference --guidance``; applied to every job.",
 )
 @click.option(
+    "--guidance-sweep",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help=(
+        "JSON of guidance settings to run from one trunk per seed (see ``_load_sweep``). Each inputs-file "
+        "line names its group (group=…), its output dir carries a {cfg} placeholder, and {pairs} in a "
+        "guidance value takes the line's pairs=… column. Not combinable with --guidance."
+    ),
+)
+@click.option(
     "--allow-guidance-overlap",
     is_flag=True,
     default=False,
@@ -708,6 +858,7 @@ def inference_batch(
     precision: str,
     hoist_sampler: bool,
     guidance_specs: tuple,
+    guidance_sweep: Path | None,
     allow_guidance_overlap: bool,
     restraint_specs: tuple[RestraintSpec, ...],
     restraint_pair_specs: tuple[RestraintSpec, ...],
@@ -729,7 +880,7 @@ def inference_batch(
     if not inputs_file and not json_paths:
         raise click.UsageError("Provide --inputs-file or one or more --json")
 
-    jobs: list[tuple[Path, Path]] = []
+    jobs: list[tuple[Path, Path, dict[str, str]]] = []
     if inputs_file:
         jobs += _parse_inputs_file(inputs_file, output_template, params)
     for jp in json_paths:
@@ -741,7 +892,16 @@ def inference_batch(
                 params_stem=params.stem,
             )
         )
-        jobs.append((jp, out_dir))
+        jobs.append((jp, out_dir, {}))
+
+    sweep_groups = None
+    if guidance_sweep is not None:
+        if guidance_specs:
+            raise click.UsageError("--guidance-sweep replaces --guidance; give one or the other")
+        sweep_groups = _load_sweep(guidance_sweep)
+        job_entries = [_sweep_entries(sweep_groups, od, extras) for _, od, extras in jobs]
+    else:
+        job_entries = [None for _ in jobs]
 
     click.echo(f"[batch] {len(jobs)} jobs queued")
 
@@ -766,6 +926,19 @@ def inference_batch(
         except ValueError as e:
             raise click.UsageError(f"--guidance: {e}") from e
         click.echo(f"[batch] guidance: {' + '.join(_describe_guidance(g) for g in guidance_specs)}")
+    if sweep_groups is not None:
+        seen = set()
+        for entries in job_entries:
+            for name, _, specs in entries:
+                if name in seen:
+                    continue
+                seen.add(name)
+                try:
+                    check_guidance_training(specs, model_cfg.diffusion)
+                except ValueError as e:
+                    raise click.UsageError(f"--guidance-sweep {name}: {e}") from e
+        for group, items in sweep_groups.items():
+            click.echo(f"[batch] sweep group {group}: " + ", ".join(n for n, _ in items))
     all_restraint_specs = tuple(restraint_specs) + tuple(restraint_pair_specs) + tuple(repel_specs)
     if all_restraint_specs:
         click.echo(
@@ -794,7 +967,7 @@ def inference_batch(
 
     seed_list = list(dict.fromkeys(seeds))
 
-    def _job_complete(od: Path) -> bool:
+    def _job_complete(od: Path, job_seeds: list[int]) -> bool:
         """A job is complete when every requested (seed, sample) CIF exists.
 
         With CLI seeds we know the exact set; without them we can't cheaply
@@ -802,16 +975,18 @@ def inference_batch(
         """
         if not od.exists():
             return False
-        if seed_list:
-            return all(p.exists() for s in seed_list for p in _seed_outputs(od, s, num_samples, save_distogram))
+        if job_seeds:
+            return all(p.exists() for s in job_seeds for p in _seed_outputs(od, s, num_samples, save_distogram))
         return any(p.name.startswith("seed-") for p in od.iterdir() if p.is_dir())
 
     n_done = 0
     n_skipped = 0
     oom: list[str] = []
     t_total = time.perf_counter()
-    for idx, (jp, od) in enumerate(jobs, 1):
-        if skip_existing and _job_complete(od):
+    for idx, ((jp, od, extras), entries) in enumerate(zip(jobs, job_entries, strict=True), 1):
+        job_seeds = [int(x) for x in extras["seeds"].split(",")] if extras.get("seeds") else seed_list
+        dirs = [e[1] for e in entries] if entries is not None else [od]
+        if skip_existing and all(_job_complete(d, job_seeds) for d in dirs):
             click.echo(f"[batch] [{idx}/{len(jobs)}] SKIP {jp.name} → {od} (all seeds/samples present)")
             n_skipped += 1
             continue
@@ -828,7 +1003,7 @@ def inference_batch(
                 od,
                 num_recycles=num_recycles,
                 num_samples=num_samples,
-                seeds=seed_list,
+                seeds=job_seeds,
                 template_cache=template_cache,
                 pdb_mmcif_dir=pdb_mmcif_dir,
                 msa_pairing=msa_pairing,
@@ -847,6 +1022,7 @@ def inference_batch(
                 restraint_after_step=restraint_after_step,
                 restraint_after_sigma=restraint_after_sigma,
                 manifest_fields=manifest_fields,
+                sweep=entries,
             )
             n_done += 1
         except torch.OutOfMemoryError as e:

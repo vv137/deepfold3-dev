@@ -376,6 +376,15 @@ logits and atom AdaLN terms (`DiffusionTransformer.forward_hoisted`,
 `AtomCrossAttTransformer.forward_hoisted`), and shares one copy across samples. See
 `docs/optimizations.md` § _Diffusion sampler_.
 
+**Trunk reuse**: `DeepFold3.forward` is `run_evoformer` followed by `sample_from_trunk`
+(sampler, confidence and distogram heads). The trunk does not depend on guidance and
+`sample_from_trunk` re-seeds the sampler's generator from the seed on every call, so
+`inference-batch --guidance-sweep` runs the trunk once per (target, seed) and samples
+every guidance setting of the line's sweep group from it, each one identical to a
+separate run with that guidance. Inputs-file lines take `key=value` columns: `group=`
+(the sweep group), `seeds=` (fold only these seeds, so a large target can be split
+across GPUs) and `pairs=` (fills `{pairs}` in the group's guidance values).
+
 ### Distance restraints (`model/restraints.py`)
 
 Restraints act on **coordinates inside the sampler**, not on the conditioning as

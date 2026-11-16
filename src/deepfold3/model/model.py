@@ -995,10 +995,51 @@ class DeepFold3(nn.Module):
             self.diffusion_head.cfg.num_samples = num_samples
 
         try:
-            embeddings, rel_feat, target_feat, seq_mask, pair_mask = self.run_evoformer(
-                features, num_recycles, seed=seed
+            trunk = self.run_evoformer(features, num_recycles, seed=seed)
+            return self.sample_from_trunk(
+                features,
+                trunk,
+                seed=seed,
+                guidance_terms=guidance_terms,
+                restraints=restraints,
+                restraint_weight=restraint_weight,
+                restraint_rigid=restraint_rigid,
+                restraint_max_step=restraint_max_step,
+                restraint_after_step=restraint_after_step,
+                restraint_after_sigma=restraint_after_sigma,
             )
+        finally:
+            self.diffusion_head.cfg.num_samples = orig_num_samples
 
+    def sample_from_trunk(
+        self,
+        features: dict[str, torch.Tensor],
+        trunk: tuple,
+        seed: int = 0,
+        num_samples: int | None = None,
+        guidance_terms: Sequence[GuidanceTerm] | None = None,
+        restraints: Sequence[Restraint] = (),
+        restraint_weight: float = 0.0,
+        restraint_rigid: bool = True,
+        restraint_max_step: float = 2.0,
+        restraint_after_step: bool = False,
+        restraint_after_sigma: float = 16.0,
+        distogram: torch.Tensor | None = None,
+    ) -> DeepFold3Output:
+        """The part of :meth:`forward` after the trunk: sampler, confidence and distogram heads.
+
+        ``trunk`` is what :meth:`run_evoformer` returned. The trunk does not
+        depend on guidance, and the sampler's generator is re-seeded from
+        ``seed`` on every call, so several guidance settings can share one
+        trunk and still start from the same noise: ``forward`` with the same
+        seed gives the same result. ``distogram`` reuses logits from an
+        earlier call on the same trunk. Other arguments as in :meth:`forward`.
+        """
+        embeddings, rel_feat, target_feat, seq_mask, pair_mask = trunk
+        orig_num_samples = self.diffusion_head.cfg.num_samples
+        if num_samples is not None:
+            self.diffusion_head.cfg.num_samples = num_samples
+        try:
             # Diffusion sampling
             device = features["res_type"].device
             generator = torch.Generator(device=device).manual_seed(seed)
@@ -1036,7 +1077,7 @@ class DeepFold3(nn.Module):
                 rep_atom_index=features.get("token_to_rep_atom"),
             )
 
-            disto_logits = self.distogram_head(embeddings["pair"])
+            disto_logits = distogram if distogram is not None else self.distogram_head(embeddings["pair"])
 
             return DeepFold3Output(
                 atom_positions=sample_result["atom_positions"],
