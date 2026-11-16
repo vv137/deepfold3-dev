@@ -249,9 +249,13 @@ def parse_interface(d: dict, ic1: str, ic2: str) -> dict:
         "tm_score": d.get("tm_score"),
         "oligo_gdtts": d.get("oligo_gdtts"),
     }
+    # Each entry is [ref_ch1, ref_ch2, mdl_ch1, mdl_ch2]; match on the reference
+    # chains only. Testing membership in the whole entry also matched the model
+    # chain names, so ref A-B mapped to model A-C answered a query for A-C: the
+    # wrong interface for 1.5% (AbAg) to 6% (PPI) of FoldBench samples.
     interfaces = d.get("dockq_interfaces") or []
     for i, iface in enumerate(interfaces):
-        if ic1 in iface and ic2 in iface:
+        if {iface[0], iface[1]} == {ic1, ic2}:
             out["dockq"] = (d.get("dockq") or [None] * len(interfaces))[i]
             out["irmsd"] = (d.get("irmsd") or [None] * len(interfaces))[i]
             out["lrmsd"] = (d.get("lrmsd") or [None] * len(interfaces))[i]
