@@ -56,6 +56,24 @@ def _evict_after_read(path: str | Path) -> None:
         os.close(fd)
 
 
+# Parameters a checkpoint may lack even under ``strict``: added with an init that
+# reproduces the old model exactly (``DiffusionConfig.cond_drop_fill: learned``
+# zero-inits ``null_pair``, which equals the zero fill), so starting from a
+# checkpoint without them changes nothing at step 0.
+_NEW_ZERO_INIT_KEYS = frozenset({"diffusion_head.null_pair"})
+
+
+def _load_state(model: nn.Module, state: dict, strict: bool) -> None:
+    res = model.load_state_dict(state, strict=False)
+    missing = [k for k in res.missing_keys if k not in _NEW_ZERO_INIT_KEYS]
+    if strict and (missing or res.unexpected_keys):
+        raise RuntimeError(
+            f"Error(s) in loading state_dict: missing keys {missing}, unexpected keys {res.unexpected_keys}"
+        )
+    for k in sorted(set(res.missing_keys) & _NEW_ZERO_INIT_KEYS):
+        rank_zero_info(f"{k} not in the checkpoint: keeping its zero init")
+
+
 def load_pretrained_weights(
     model: nn.Module,
     path: str | Path,
@@ -75,13 +93,13 @@ def load_pretrained_weights(
 
         state = load_file(str(p), device=str(device))
         _evict_after_read(p)
-        model.load_state_dict(state, strict=strict)
+        _load_state(model, state, strict)
         rank_zero_info(f"Loaded pretrained weights from {p}")
     elif p.suffix == ".pt":
         ckpt = torch.load(str(p), map_location=device, weights_only=False)
         _evict_after_read(p)
         state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
-        model.load_state_dict(state, strict=strict)
+        _load_state(model, state, strict)
         rank_zero_info(f"Loaded pretrained weights from {p}")
 
 

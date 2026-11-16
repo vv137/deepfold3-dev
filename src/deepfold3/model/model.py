@@ -795,7 +795,11 @@ class DeepFold3(nn.Module):
                         cm_c = clean_mask[:, chunk_i * diffusion_chunk_size : (chunk_i + 1) * diffusion_chunk_size]
                     # Mask per chunk: each chunk's backward frees its graph, and a
                     # mask node built once before the loop would be part of it.
-                    emb_c = emb_det if cond_pair_keep is None else mask_trunk_pair(emb_det, cond_pair_keep)
+                    emb_c = (
+                        emb_det
+                        if cond_pair_keep is None
+                        else mask_trunk_pair(emb_det, cond_pair_keep, self.diffusion_head.null_pair)
+                    )
                     gt_aug_c, denoised_c, noise_levels_c = self.diffusion_head.sample_training(
                         gt_positions=diffusion_gt_pos,
                         gt_mask=diffusion_gt_mask,
@@ -867,7 +871,7 @@ class DeepFold3(nn.Module):
                 if cond_pair_keep is not None:
                     from deepfold3.model.diffusion import mask_trunk_pair
 
-                    diff_embeddings = mask_trunk_pair(embeddings, cond_pair_keep)
+                    diff_embeddings = mask_trunk_pair(embeddings, cond_pair_keep, self.diffusion_head.null_pair)
                 gt_aug, denoised, noise_levels = self.diffusion_head.sample_training(
                     gt_positions=diffusion_gt_pos,
                     gt_mask=diffusion_gt_mask,

@@ -466,6 +466,14 @@ class DiffusionConfig:
     # an input the model has never seen.
     use_conditioning_prob: float = 1.0
     cond_drop: Literal["pair", "both"] = "pair"
+    # What a dropped trunk-pair entry becomes: "zero" (OF3; the default) or
+    # "learned", one trainable ``[c_pair]`` vector (``DiffusionHead.null_pair``,
+    # zero-initialised, so step 0 equals "zero") broadcast over every dropped
+    # (i, j) — the full drop, the interface drop and the guidance branches
+    # alike. The trunk single under ``cond_drop: both`` is still zeroed.
+    # Changes the state dict (one extra parameter): starting a "learned" run
+    # from a "zero" checkpoint needs ``load_strict: false``.
+    cond_drop_fill: Literal["zero", "learned"] = "zero"
     # Fraction of drops that zero a random subset of INTER-CHAIN pair blocks
     # instead of the full ``cond_drop`` drop, so the model also learns
     # "these interfaces unconditioned, everything else conditioned" — what

@@ -303,8 +303,10 @@ def cond_drop_stats(
     return out
 
 
-def mask_trunk_pair(embeddings: dict[str, torch.Tensor], pair_keep: torch.Tensor) -> dict[str, torch.Tensor]:
-    """Copy of ``embeddings`` with the trunk pair zeroed where ``pair_keep`` is False.
+def mask_trunk_pair(
+    embeddings: dict[str, torch.Tensor], pair_keep: torch.Tensor, fill: torch.Tensor | None = None
+) -> dict[str, torch.Tensor]:
+    """Copy of ``embeddings`` with the trunk pair zeroed (or set to ``fill``, ``[C]``) where ``pair_keep`` is False.
 
     Same effect as ``compute_static(use_conditioning=False)`` restricted to
     those entries: ``pair_cond`` is computed per (i, j), so a dropped entry
@@ -313,7 +315,10 @@ def mask_trunk_pair(embeddings: dict[str, torch.Tensor], pair_keep: torch.Tensor
     modified.
     """
     pair = embeddings["pair"]
-    return {**embeddings, "pair": pair * pair_keep.unsqueeze(-1).to(pair.dtype)}
+    keep = pair_keep.unsqueeze(-1)
+    if fill is None:
+        return {**embeddings, "pair": pair * keep.to(pair.dtype)}
+    return {**embeddings, "pair": torch.where(keep, pair, fill.to(pair.dtype))}
 
 
 def _augment_in_place(
@@ -899,6 +904,9 @@ class DiffusionHead(nn.Module):
             optim=optim,
         )
 
+        # Learned stand-in for dropped trunk-pair entries (``cond_drop_fill``).
+        self.null_pair = nn.Parameter(torch.zeros(c_pair)) if cfg.cond_drop_fill == "learned" else None
+
         # Atom encoder (per-atom conditioning → token activations)
         self.atom_encoder = AtomEncoder(
             per_atom_channels=cfg.atom_cross_att.per_atom_channels,
@@ -975,8 +983,14 @@ class DiffusionHead(nn.Module):
         cond_single, cond_pair = embeddings["single"], embeddings["pair"]
         if not use_conditioning:
             cond_pair = cond_pair * 0
+            if self.null_pair is not None:
+                cond_pair = cond_pair + self.null_pair.to(cond_pair.dtype)
             if self.cfg.cond_drop == "both":
                 cond_single = cond_single * 0
+        elif self.null_pair is not None and self.training and torch.is_grad_enabled():
+            # Keep ``null_pair`` in every training graph so DDP sees the same
+            # parameter set on ranks that did not drop (zero gradient there).
+            cond_single = cond_single + 0 * self.null_pair.sum().to(cond_single.dtype)
         single_cond_pre_noise, pair_cond = self.conditioning.compute_static(
             single_emb=cond_single,
             pair_emb=cond_pair,
@@ -1420,7 +1434,9 @@ class DiffusionHead(nn.Module):
             if term.pair_keep is not None:
                 u_inputs = {
                     **static_inputs,
-                    "embeddings": mask_trunk_pair(static_inputs["embeddings"], _ensure_b(term.pair_keep)),
+                    "embeddings": mask_trunk_pair(
+                        static_inputs["embeddings"], _ensure_b(term.pair_keep), self.null_pair
+                    ),
                 }
                 static_u = self.compute_static(**u_inputs)
             else:

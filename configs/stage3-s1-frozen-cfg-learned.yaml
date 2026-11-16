@@ -1,0 +1,10 @@
+base: stage3-s1-frozen-cfg.yaml
+
+# stage3-s1-frozen-cfg.yaml with a learned stand-in for dropped trunk-pair
+# entries (DiffusionHead.null_pair, zero-initialised: step 0 equals the zero
+# fill). The start checkpoint has no null_pair; the loader accepts that one
+# missing key under load_strict and logs it.
+
+model:
+  diffusion:
+    cond_drop_fill: learned
