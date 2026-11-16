@@ -23,7 +23,7 @@ local (source host)                          Hangang
 | `setup_env.sh` | Hangang GPU login node | aarch64 venv via `uv sync --frozen`, then torch swapped to the `cu126` build (driver is CUDA 12.8); afterwards never `uv run`/`uv sync` there |
 | `check.sbatch` | 1 GPU node | GPUs, NCCL all-reduce, pack integrity, file count, training DataLoader smoke test |
 | `warmup.sbatch` | 1 GPU node | fills the Triton autotune cache (`$HOME/.cache/deepfold3-triton`) for a training config, once before `submit.sh` |
-| `submit.sh` + `train.sbatch` | Hangang | training as a chain of 24 h jobs with auto-resume |
+| `submit.sh` + `train.sbatch` | Hangang | training as a chain of jobs (24 h each, `TIME` to change) with auto-resume |
 | `keepalive.sh` | Hangang | report files close to the 15-day purge (optionally refresh atime) |
 | `smoke_data.py` | (called by `check.sbatch`) | builds the real DataLoader from a config and times it |
 | `smoke_walltime.sh` | login node | 2-node, 2-link test that the walltime checkpoint is written and resumed |
@@ -193,6 +193,6 @@ Facts worth knowing:
 - **Network:** node hostnames resolve to the management network (`bond0`, `10.161.64.x`, `*.hostmgmt`); Slingshot is `hsn0..3` (`10.169.x`). Rendezvous over the hostname works once rank 0 is on the right node; `DF3_RDZV_HSN=1` switches it to the first node's `hsn0` address.
 - **Not yet verified (as of 2026-10-29):** whether the venv's NCCL (2.29.3, cu12 wheel) works with KISTI's `aws-ofi-nccl/1.20.0`; KISTI validated the plugin with the NCCL in their containers. If the log shows `Using network Socket` or `Failed to initialize any NET plugin`, the fallback is the Slingshot image `/apps/common/kisti-container/images/slingshot/kisti-pytorch-25.03-gh200-r1-aarch64.sif` via `kisti-container --runtime singularity --nccl ofi` (torch 2.7-era: check API / Triton compatibility first).
 - **Slurm limits:** partition `normal` carries QoS `normal_gpu`: 24 h walltime and at most 5 jobs per user, counting PENDING ones (MaxJobsPU = MaxSubmitPU = 5; a full chain uses all 5, so run `check` / `warmup` before `submit.sh`). Jobs are submitted only from `/scratch` or `/appsdata`; `--comment="field=…;appl=…"` is mandatory.
-- **Dedicated nodes (beta service only):** during the Hangang beta, the 거대연구 fast track gave bs0246 partition `exclusive08` (64 nodes, 2026-11-16 10:00 – 11-23 10:00). It had no QoS, so its jobs did not count against `normal`'s 5 and had no walltime cap (`submit.sh` still sets 24 h). This was a beta-period arrangement; do not assume it after the official opening.
+- **Dedicated nodes (beta service only):** during the Hangang beta, the 거대연구 fast track gave bs0246 partition `exclusive08` (64 nodes, 2026-11-16 10:00 – 11-23 10:00). It had no QoS, so its jobs did not count against `normal`'s 5 and had no walltime cap; pass `TIME=48:00:00` (or longer) to `submit.sh` to run fewer, longer links there. This was a beta-period arrangement; do not assume it after the official opening.
 - **Filesystem:** 4 KiB pages; `/scratch` (Lustre) honours `posix_fadvise(DONTNEED)` and `fincore` reports it correctly; files untouched for 15 days are purged.
 - **`EXTRA_ARGS`** travels through `sbatch --export`, so no commas.
