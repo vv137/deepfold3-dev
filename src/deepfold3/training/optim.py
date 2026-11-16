@@ -503,6 +503,7 @@ class WrappedOptimizer:
         self._nan_accum: torch.Tensor | None = None
         self._nan_gather_buf: torch.Tensor | None = None
         self._grad_norm_gather_buf: torch.Tensor | None = None
+        self._null_pair = next((p for n, p in model.named_parameters() if n.endswith("diffusion_head.null_pair")), None)
         # Record ids of every sample that contributed to the current
         # accumulation window on THIS rank. Reset in ``step_or_skip`` so
         # each window starts empty; logged on NaN/Inf skip to identify
@@ -597,6 +598,9 @@ class WrappedOptimizer:
         """
         self.scaler.unscale_(self.optimizer)
 
+        if self._null_pair is not None and self._null_pair.grad is not None:
+            # Already all-reduced here unless per-rank clip (then this rank's own).
+            state.last_null_pair_grad_norm = self._null_pair.grad.detach().float().norm()
         clip = self.cfg.grad_clip_norm if self.cfg.grad_clip_norm > 0 else float("inf")
         if self.cfg.grad_norm_fp64:
             grad_norm = _clip_grad_norm_fp64(self.model.parameters(), clip).detach()

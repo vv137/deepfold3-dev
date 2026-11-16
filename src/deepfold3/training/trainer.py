@@ -844,6 +844,9 @@ class Trainer:
         # of the averaged, already-clipped gradient the optimizer steps on.
         gn_global_sum = torch.zeros((), device=self.dist.device, dtype=torch.float64)
         gn_global_count = 0
+        # ``null_pair`` grad norm window mean (``cond_drop_fill: learned`` only).
+        null_gn_sum = torch.zeros((), device=self.dist.device, dtype=torch.float64)
+        null_gn_count = 0
 
         # SIGUSR2 → request immediate checkpoint (preemption safety)
         # SIGTERM/SIGINT/DF3_STOP_FILE → checkpoint + graceful exit (SLURM walltime, kill, Ctrl+C)
@@ -999,6 +1002,9 @@ class Trainer:
                     if self.state.last_grad_norm_global is not None:
                         gn_global_sum += self.state.last_grad_norm_global.detach().to(torch.float64)
                         gn_global_count += 1
+                    if self.state.last_null_pair_grad_norm is not None:
+                        null_gn_sum += self.state.last_null_pair_grad_norm.to(torch.float64)
+                        null_gn_count += 1
 
                 # Flush probe row (rank-0 only); pass per-microstep loss
                 # (total + components from ``loss_dict``) so the probe JSONL
@@ -1122,6 +1128,9 @@ class Trainer:
                     gn_count = 0
                     gn_global_sum.zero_()
                     gn_global_count = 0
+                    null_grad_norm = (null_gn_sum / null_gn_count).item() if null_gn_count > 0 else None
+                    null_gn_sum.zero_()
+                    null_gn_count = 0
 
                     # Event-timed step time: window sum (→ dt mean / tok-s) plus
                     # per-effective-step min/max (→ burst tail). ``flush`` issues
@@ -1238,6 +1247,8 @@ class Trainer:
                         # with ``act_rms/``; pass through verbatim so the
                         # WandB workspace's saved panel grouping picks it up.
                         payload.update(act_rms)
+                        if null_grad_norm is not None:
+                            payload["train/null_pair/grad_norm"] = null_grad_norm
                         self.trackers.log(payload, step=self.state.effective_step)
 
                 # --- Checkpoint (before eval so weights are saved even if eval crashes) ---

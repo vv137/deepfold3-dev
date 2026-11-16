@@ -196,6 +196,9 @@ def training_step(
     for k, v in pred.get("__cond_drop__", {}).items():
         loss_dict[f"cond_drop/{k}"] = v
         loss_dict_counts[f"cond_drop/{k}"] = 1
+    for k, v in pred.get("__null_pair__", {}).items():
+        loss_dict[f"null_pair/{k}"] = v
+        loss_dict_counts[f"null_pair/{k}"] = 1
 
     if _timing:
         torch.cuda.synchronize(device)

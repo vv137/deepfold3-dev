@@ -303,6 +303,34 @@ def cond_drop_stats(
     return out
 
 
+@torch.no_grad()
+def null_pair_stats(
+    null_pair: torch.Tensor,  # [C]
+    pair: torch.Tensor,  # [B, N, N, C] trunk pair
+    asym_id: torch.Tensor | None,  # [B, N]
+    seq_mask: torch.Tensor,  # [B, N]
+) -> dict[str, torch.Tensor]:
+    """Diagnostics for ``cond_drop_fill: learned`` (logged as ``train/null_pair/*``).
+
+    ``norm`` = ‖v‖; ``norm_ratio`` = ‖v‖ / mean ‖z_ij‖ over valid pairs;
+    ``cos_intra`` / ``cos_inter`` = cosine of v with the batch's mean intra- /
+    inter-chain trunk pair vector (does v imitate an average pair, or point
+    elsewhere?). ``cos_inter`` is omitted when the crop has a single chain.
+    """
+    v = null_pair.detach().float()
+    z = pair.detach().float()
+    valid = seq_mask.bool()
+    pv = valid.unsqueeze(-1) & valid.unsqueeze(-2)
+    out = {"norm": v.norm()}
+    zn = z.norm(dim=-1)
+    out["norm_ratio"] = out["norm"] / zn[pv].mean().clamp(min=1e-12)
+    same = asym_id.unsqueeze(-1) == asym_id.unsqueeze(-2) if asym_id is not None else torch.ones_like(pv)
+    for name, m in (("intra", pv & same), ("inter", pv & ~same)):
+        if bool(m.any()):
+            out[f"cos_{name}"] = torch.nn.functional.cosine_similarity(v, z[m].mean(0), dim=0)
+    return out
+
+
 def mask_trunk_pair(
     embeddings: dict[str, torch.Tensor], pair_keep: torch.Tensor, fill: torch.Tensor | None = None
 ) -> dict[str, torch.Tensor]:

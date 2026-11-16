@@ -729,6 +729,13 @@ class DeepFold3(nn.Module):
                 pred["__cond_drop__"] = cond_drop_stats(
                     features.get("asym_id"), seq_mask, use_conditioning=use_conditioning, pair_keep=cond_pair_keep
                 )
+            if self.training and self.diffusion_head.null_pair is not None:
+                from deepfold3.model.diffusion import null_pair_stats
+
+                # Read by ``training_step`` into ``train/null_pair/*``.
+                pred["__null_pair__"] = null_pair_stats(
+                    self.diffusion_head.null_pair, embeddings["pair"], features.get("asym_id"), seq_mask
+                )
 
             # Masked / partial diffusion (motif scaffolding) — see
             # ``DiffusionConfig.diffusion_mask_prob``. Built here because it needs

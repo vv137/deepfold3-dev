@@ -106,3 +106,75 @@ def test_strict_load_tolerates_only_a_missing_null_pair(tmp_path):
     torch.save({"model": {n: v for n, v in old.state_dict().items() if n != k}}, path)
     with pytest.raises(RuntimeError, match="missing keys"):
         load_pretrained_weights(new, path, strict=True, device=torch.device("cpu"))
+
+
+def test_null_pair_stats():
+    from deepfold3.model.diffusion import null_pair_stats
+
+    asym = torch.tensor([[0, 0, 1]])
+    pair = torch.zeros(1, 3, 3, 4)
+    pair[0, :2, :2] = torch.tensor([1.0, 0, 0, 0])  # intra (chain 0)
+    pair[0, 2, 2] = torch.tensor([1.0, 0, 0, 0])  # intra (chain 1)
+    pair[0, :2, 2] = pair[0, 2, :2] = torch.tensor([0, 2.0, 0, 0])  # inter
+    v = torch.tensor([0, 3.0, 0, 0])
+    s = null_pair_stats(v, pair, asym, torch.ones(1, 3))
+    assert torch.isclose(s["norm"], torch.tensor(3.0))
+    assert torch.isclose(s["cos_inter"], torch.tensor(1.0))
+    assert torch.isclose(s["cos_intra"], torch.tensor(0.0))
+    assert torch.isclose(s["norm_ratio"], torch.tensor(3.0 / ((5 * 1.0 + 4 * 2.0) / 9)))
+    assert "cos_inter" not in null_pair_stats(v, pair, torch.zeros(1, 3, dtype=torch.long), torch.ones(1, 3))
+
+
+@pytest.mark.parametrize("fill", ["learned", "zero"])
+def test_forward_training_emits_null_pair_stats_only_when_learned(fill, monkeypatch):
+    import deepfold3.model.diffusion as diffusion
+
+    model = _tiny_model(use_conditioning_prob=0.8, cond_drop_fill=fill).train()
+    seen = {}
+    real = diffusion.null_pair_stats
+
+    def spy(*a, **kw):
+        seen["stats"] = real(*a, **kw)
+        return seen["stats"]
+
+    monkeypatch.setattr(diffusion, "null_pair_stats", spy)
+    torch.manual_seed(0)
+    model.forward_training(
+        _tiny_batch(), num_recycles=0, diffusion_batch_size=2, mini_rollout_steps=2, compute_confidence=False
+    )
+    if fill == "zero":
+        assert "stats" not in seen
+    else:
+        assert {"norm", "norm_ratio", "cos_intra", "cos_inter"} <= set(seen["stats"])
+
+
+def test_wrapped_optimizer_records_null_pair_grad_norm():
+    from unittest.mock import MagicMock
+
+    from torch import nn
+    from torch.amp import GradScaler
+
+    from deepfold3.model.config import TrainingConfig
+    from deepfold3.training.distributed import DistInfo
+    from deepfold3.training.optim import WrappedOptimizer
+    from deepfold3.training.state import TrainState
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.diffusion_head = nn.Module()
+            self.diffusion_head.null_pair = nn.Parameter(torch.zeros(4))
+
+    model = M()
+    opt = WrappedOptimizer(
+        optimizer=torch.optim.AdamW(model.parameters(), lr=1e-3),
+        scheduler=MagicMock(),
+        scaler=GradScaler("cpu", enabled=False),
+        model=model,
+        dist_info=DistInfo(rank=0, world_size=1, local_rank=0, device=torch.device("cpu")),
+        cfg=TrainingConfig(lr=1e-3, accumulate_grad_batches=1, grad_norm_fp64=True),
+    )
+    (model.diffusion_head.null_pair * torch.tensor([3.0, 4.0, 0.0, 0.0])).sum().backward()
+    state = TrainState()
+    opt._unscale_clip_and_measure(state)
+    assert torch.isclose(state.last_null_pair_grad_norm, torch.tensor(5.0))
