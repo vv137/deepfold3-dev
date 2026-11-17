@@ -775,9 +775,13 @@ class DeepFold3(nn.Module):
                 single_real = embeddings["single"]
                 target_feat_real = target_feat
 
-                pair_det = pair_real.detach().requires_grad_(True)
-                single_det = single_real.detach().requires_grad_(True)
-                target_feat_det = target_feat_real.detach().requires_grad_(True)
+                # A leaf asks for a grad only when its source carries a graph:
+                # with the trunk frozen (``freeze_modules``) the trunk outputs
+                # have none, and flowing a leaf grad into them below raises
+                # "element 0 of tensors does not require grad".
+                pair_det = pair_real.detach().requires_grad_(pair_real.requires_grad)
+                single_det = single_real.detach().requires_grad_(single_real.requires_grad)
+                target_feat_det = target_feat_real.detach().requires_grad_(target_feat_real.requires_grad)
 
                 emb_det = {
                     "pair": pair_det,

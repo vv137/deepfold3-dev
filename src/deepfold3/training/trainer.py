@@ -391,6 +391,12 @@ class Trainer:
         return is_chunked_diffusion_active(self.cfg)
 
     def _scaled_backward(self, loss: torch.Tensor) -> None:
+        # Chunked diffusion already back-propped its chunks inside the forward
+        # and returns its share detached. With the trunk frozen
+        # (``freeze_modules``) nothing else in the loss has a graph, so the aux
+        # backward has nothing to do. Unchunked, a graph-less loss still raises.
+        if not loss.requires_grad and self._chunked_diffusion_active():
+            return
         scaled_backward(self.scaler, loss, self.cfg.accumulate_grad_batches)
 
     # ------------------------------------------------------------------
