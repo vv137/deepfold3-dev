@@ -115,6 +115,28 @@ def rescue_set(node: str, scope: str, cat: str) -> dict | None:
     return {"node": node, "scope": scope, "rows": rows} if rows else None
 
 
+def points(cat: str) -> dict:
+    """Per-interface (oracle, mean, conf) DockQ of every series on the page, for the xy scatter.
+
+    Interfaces are the union over series; a series lacking one stores null there. Values are
+    rounded to 3 decimals to keep the page small.
+    """
+    names = [s for s, _ in BASE]
+    for scope in ("full", "abag", "all"):
+        for node in MODELS:
+            names += [series_for(node, scope, w) for w in W_GRID]
+    names = list(dict.fromkeys(names))
+    data = {n: A.load(n, cat) for n in names}
+    data = {n: d for n, d in data.items() if len(d) >= A.TOTAL_INTERFACES[cat] / 2}
+    keys = sorted(set().union(*(set(d) for d in data.values()))) if data else []
+    out = {}
+    for n, d in data.items():
+        out[n.partition(":")[0]] = [
+            [round(A.oracle(d[k]), 3), round(A.mean(d[k]), 3), round(A.conf(d[k]), 3)] if k in d else None for k in keys
+        ]
+    return {"keys": [f"{k[0]} {k[1]}:{k[2]}" for k in keys], "series": out}
+
+
 def build() -> dict:
     tables, curves, rescues = [], [], []
     for cat, label, scopes in CATEGORIES:
@@ -139,7 +161,14 @@ def build() -> dict:
                     curves.append({"cat": label, **c})
                 if r := rescue_set(node, scope, cat):
                     rescues.append({"cat": label, **r})
-    return {"built": time.strftime("%Y-%m-%d %H:%M KST"), "tables": tables, "curves": curves, "rescues": rescues}
+    pts = {label: points(cat) for cat, label, _ in CATEGORIES}
+    return {
+        "built": time.strftime("%Y-%m-%d %H:%M KST"),
+        "tables": tables,
+        "curves": curves,
+        "rescues": rescues,
+        "points": pts,
+    }
 
 
 def main():

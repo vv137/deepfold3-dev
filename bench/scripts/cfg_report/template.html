@@ -86,6 +86,12 @@ code { font-family: var(--f-mono); font-size: 0.9em; }
 .rs summary { cursor: pointer; color: var(--fg); }
 .rs .lst { font-family: var(--f-mono); font-size: 11.5px; line-height: 1.6; white-space: normal; text-align: left; }
 .up { color: var(--good); } .down { color: var(--stop); }
+.sel { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+.sel select { font: 13px var(--f-body); color: var(--fg); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; max-width: 100%; }
+.pt { stroke: var(--panel); stroke-width: 0.6; }
+.pt.up { fill: var(--good); } .pt.down { fill: var(--stop); } .pt.same { fill: var(--muted); }
+.diag { stroke: var(--fg); stroke-width: 1; opacity: 0.5; }
+.thr { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 3; }
 .ctrl { display: flex; flex-wrap: wrap; gap: 10px 24px; }
 .curves { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
 .chart { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 10px 4px; min-width: 0; position: relative; }
@@ -151,6 +157,18 @@ code { font-family: var(--f-mono); font-size: 0.9em; }
     <div class="curves" id="curves"></div>
     <div class="legend" id="curve-legend"></div>
     <p class="caption" id="cap-curve"></p>
+  </section>
+
+  <section>
+    <h2>interface별 비교 (x = 기준, y = 비교 대상)</h2>
+    <p class="lede">점 하나가 interface 하나입니다. 대각선 위는 비교 대상이 더 좋은 interface, 아래는 더 나쁜 interface입니다. 점선은 성공 기준 DockQ 0.23입니다. 색은 |Δ| > 0.05 기준의 좋아짐 / 나빠짐입니다. Max(Oracle, 25개 중 최고)와 Mean(25개 평균)을 나란히, Conf(모델이 고른 1위)도 함께 그립니다.</p>
+    <div class="tabs" role="tablist" data-group="sc-cat"></div>
+    <div class="ctrl">
+      <label class="sel">기준 (x) <select id="sc-x"></select></label>
+      <label class="sel">비교 (y) <select id="sc-y"></select></label>
+    </div>
+    <div class="curves" id="scatter"></div>
+    <p class="caption" id="cap-sc"></p>
   </section>
 
   <section>
@@ -428,6 +446,87 @@ function drawRescue(cat, scope) {
   }
 }
 
+const SC_PREFIX = [["stage1-rescore", "s1"], ["stage2-001-rescore", "s2"], ["stage3-s1-frozen-learned", "fl"],
+  ["stage3-s1-frozen-zero", "fz"], ["stage3-s1-001", "s3s1"], ["stage3-001", "s3"]];
+function scLabel(name) {
+  const m = name.match(/^(.+?)(?:-cfg-(full|abag|all)_w(-?[\d.]+))?$/);
+  const node = (SC_PREFIX.find(([p]) => p === m[1]) || [null, null])[1];
+  const model = node ? NODES[node].short : m[1];
+  return m[2] ? `${model} · W ${parseFloat(m[3])} · ${m[2]}` : `${model} · W 1`;
+}
+const SC_METRICS = [[0, "Max (Oracle)"], [1, "Mean"], [2, "Conf"]];
+let scCat = null;
+
+function drawScatter() {
+  const P = DATA.points[scCat], xs = P.series[document.getElementById("sc-x").value], ys = P.series[document.getElementById("sc-y").value];
+  const host = document.getElementById("scatter"); host.innerHTML = "";
+  const W = 320, H = 320, m = 38, T = 0.23;
+  const X = v => m + v * (W - m - 10), Y = v => H - m - v * (H - m - 10);
+  let caption = [];
+  for (const [mi, title] of SC_METRICS) {
+    const box = document.createElement("div"); box.className = "chart";
+    const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": title });
+    const grid = el("g", { class: "grid" }), axis = el("g", { class: "axis" });
+    for (const v of [0, 0.25, 0.5, 0.75, 1]) {
+      grid.appendChild(el("line", { x1: X(0), x2: X(1), y1: Y(v), y2: Y(v) }));
+      grid.appendChild(el("line", { x1: X(v), x2: X(v), y1: Y(0), y2: Y(1) }));
+      axis.appendChild(el("text", { x: X(0) - 5, y: Y(v) + 3, "text-anchor": "end" }, v.toFixed(2)));
+      axis.appendChild(el("text", { x: X(v), y: Y(0) + 13, "text-anchor": "middle" }, v.toFixed(2)));
+    }
+    axis.appendChild(el("text", { x: (X(0) + X(1)) / 2, y: H - 4, "text-anchor": "middle", class: "axis-title" }, "기준 DockQ"));
+    axis.appendChild(el("text", { x: 10, y: (Y(0) + Y(1)) / 2, "text-anchor": "middle", class: "axis-title", transform: `rotate(-90 10 ${(Y(0) + Y(1)) / 2})` }, "비교 DockQ"));
+    svg.appendChild(grid); svg.appendChild(axis);
+    svg.appendChild(el("line", { class: "diag", x1: X(0), y1: Y(0), x2: X(1), y2: Y(1) }));
+    svg.appendChild(el("line", { class: "thr", x1: X(T), x2: X(T), y1: Y(0), y2: Y(1) }));
+    svg.appendChild(el("line", { class: "thr", x1: X(0), x2: X(1), y1: Y(T), y2: Y(T) }));
+    const tip = document.createElement("div"); tip.className = "tip"; tip.hidden = true;
+    let up = 0, down = 0, same = 0, gain = 0, loss = 0, n = 0;
+    P.keys.forEach((k, i) => {
+      if (!xs || !ys || !xs[i] || !ys[i]) return;
+      const a = xs[i][mi], b = ys[i][mi], d = b - a; n++;
+      const cls = d > 0.05 ? "up" : d < -0.05 ? "down" : "same";
+      if (cls === "up") up++; else if (cls === "down") down++; else same++;
+      if (a < T && b >= T) gain++; if (a >= T && b < T) loss++;
+      const c = el("circle", { cx: X(a), cy: Y(b), r: 2.6, class: `pt ${cls}` });
+      c.addEventListener("mouseenter", ev => {
+        tip.textContent = `${k}\n기준 ${a.toFixed(3)} → 비교 ${b.toFixed(3)} (${d >= 0 ? "+" : ""}${d.toFixed(3)})`;
+        tip.hidden = false;
+        const bx = box.getBoundingClientRect();
+        tip.style.left = Math.min(ev.clientX - bx.left + 10, bx.width - 200) + "px"; tip.style.top = (ev.clientY - bx.top + 10) + "px";
+      });
+      c.addEventListener("mouseleave", () => { tip.hidden = true; });
+      svg.appendChild(c);
+    });
+    box.innerHTML = `<h3>${title}</h3><p class="caption"><span class="up">▲ ${up}</span> · <span class="down">▼ ${down}</span> · ±0.05 안 ${same} · 성공 전환 <span class="up">+${gain}</span> / <span class="down">−${loss}</span></p>`;
+    box.appendChild(svg); box.appendChild(tip); host.appendChild(box);
+    caption.push(n);
+  }
+  document.getElementById("cap-sc").textContent = `두 series가 모두 가진 interface ${caption[0] || 0}개. ▲/▼: 비교 − 기준 > +0.05 / < −0.05. 성공 전환: 0.23을 넘거나 내려간 interface 수.`;
+}
+
+function setupScatter() {
+  if (!DATA.points) return;
+  const bar = document.querySelector('.tabs[data-group="sc-cat"]');
+  const sx = document.getElementById("sc-x"), sy = document.getElementById("sc-y");
+  const fill = (cat) => {
+    const names = Object.keys(DATA.points[cat].series);
+    const opts = names.map(n => `<option value="${n}">${scLabel(n)}</option>`).join("");
+    const keepX = sx.value, keepY = sy.value;
+    sx.innerHTML = opts; sy.innerHTML = opts;
+    sx.value = names.includes(keepX) ? keepX : (names.includes("stage3-s1-frozen-zero") ? "stage3-s1-frozen-zero" : names[0]);
+    sy.value = names.includes(keepY) ? keepY : (names.includes("stage3-s1-frozen-zero-cfg-full_w0.6") ? "stage3-s1-frozen-zero-cfg-full_w0.6" : names[1] || names[0]);
+  };
+  Object.keys(DATA.points).forEach((cat, i) => {
+    const b = document.createElement("button"); b.type = "button"; b.role = "tab"; b.textContent = cat;
+    b.addEventListener("click", () => {
+      bar.querySelectorAll("button").forEach(x => x.setAttribute("aria-selected", "false"));
+      b.setAttribute("aria-selected", "true"); scCat = cat; fill(cat); drawScatter();
+    });
+    bar.appendChild(b); if (i === 0) b.click();
+  });
+  sx.addEventListener("change", drawScatter); sy.addEventListener("change", drawScatter);
+}
+
 function setupRescue() {
   if (!DATA.rescues || !DATA.rescues.length) return;
   const bar = document.querySelector('.tabs[data-group="rescue"]');
@@ -449,4 +548,5 @@ setupTabs("base", DATA.tables.filter(t => t.kind === "base"), false);
 setupTabs("sweep", DATA.tables.filter(t => t.kind === "sweep"), true);
 setupCurves();
 setupRescue();
+setupScatter();
 </script>
