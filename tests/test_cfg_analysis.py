@@ -72,3 +72,13 @@ def test_rescue_and_loss():
 )
 def test_parse_series(name, parsed):
     assert A.parse_series(name) == parsed
+
+
+def test_split_chunks_gives_ordinary_runs_and_null_counts():
+    """125 samples = 5 passes of 5 per seed; pass 0 vs pass c is the W = 1 null."""
+    key = ("x", "A", "B")
+    v = [A.Sample(str(seed), 0.5, 0.5 if (seed == 0 and s == 7) else 0.0, s) for seed in range(5) for s in range(25)]
+    passes = A.split_chunks({key: v})
+    assert len(passes) == 5 and all(len(p[key]) == 25 for p in passes)
+    assert {s.sample for s in passes[1][key]} == set(range(5, 10))
+    assert A.null_rescue(passes, [key]) == [(1, 0), (0, 0), (0, 0), (0, 0)]
