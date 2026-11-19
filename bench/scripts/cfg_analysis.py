@@ -354,8 +354,11 @@ def cmd_rescue(a):
 
 
 def cmd_null(a):
-    big = load(a.series, a.category, samples=None)
-    passes = split_chunks({k: v for k, v in big.items() if len(v) == a.samples}, a.chunk)
+    big = {k: v for k, v in load(a.series, a.category, samples=None).items() if len(v) == a.samples}
+    if not big:
+        print(f"{a.category}: {a.series} has no interface with {a.samples} scored samples")
+        return
+    passes = split_chunks(big, a.chunk)
     keys = common_set({str(i): p for i, p in enumerate(passes)})
     print(f"{a.category}: {a.series}, {len(passes)} passes of {a.chunk} per seed, {len(keys)} interfaces\n")
     if a.check:
