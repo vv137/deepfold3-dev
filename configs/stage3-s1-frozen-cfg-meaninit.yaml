@@ -1,0 +1,15 @@
+base: stage3-s1-frozen-cfg-learned.yaml
+
+# stage3-s1-frozen-cfg-learned.yaml with the learned fill started at the mean
+# trunk pair of the start checkpoint's (frozen) trunk instead of zero. Direction
+# and log scale both train (null_pair = exp(log_scale) * direction).
+#
+# The vector comes from scripts/null_pair_stats.py on stage3-s1-001 5k (400
+# training crops of this config's data mix; Hangang job 1313212). Any other
+# trunk needs its own stats file.
+
+model:
+  diffusion:
+    null_pair_init: /scratch/t529a02/deepfold3/runs/null_pair_stats/stage3-s1-001-5000.pt
+    null_pair_init_key: mean_all
+    null_pair_train: all
