@@ -58,9 +58,9 @@ def _evict_after_read(path: str | Path) -> None:
 
 # Parameters a checkpoint may lack even under ``strict``: added with an init that
 # reproduces the old model exactly (``DiffusionConfig.cond_drop_fill: learned``
-# zero-inits ``null_pair``, which equals the zero fill), so starting from a
+# zero-inits ``null_pair_dir`` / ``null_pair_log_scale``, which equals the zero fill), so starting from a
 # checkpoint without them changes nothing at step 0.
-_NEW_ZERO_INIT_KEYS = frozenset({"diffusion_head.null_pair"})
+_NEW_ZERO_INIT_KEYS = frozenset({"diffusion_head.null_pair_dir", "diffusion_head.null_pair_log_scale"})
 
 
 def _load_state(model: nn.Module, state: dict, strict: bool) -> None:

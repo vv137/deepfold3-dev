@@ -220,6 +220,7 @@ class Trainer:
         # Load pretrained weights if specified
         if self.cfg.params_path:
             self._load_pretrained(self.cfg.params_path)
+        self._init_null_pair()
 
         # Freeze parameters for confidence-only training (stage 3)
         if self.cfg.train_confidence_only and self.cfg.freeze_modules:
@@ -342,6 +343,27 @@ class Trainer:
     # ------------------------------------------------------------------
     # Data setup
     # ------------------------------------------------------------------
+
+    def _init_null_pair(self) -> None:
+        """``cond_drop_fill: learned``: start the fill from ``null_pair_init`` and freeze per ``null_pair_train``.
+
+        Runs before a resume restores the checkpoint, which then overrides the init.
+        """
+        dcfg = self.model_cfg.diffusion
+        head = self.model.diffusion_head
+        if head.null_pair is None:
+            return
+        if dcfg.null_pair_init:
+            vecs = torch.load(dcfg.null_pair_init, map_location="cpu", weights_only=True)
+            head.init_null_pair(vecs[dcfg.null_pair_init_key])
+            logger.info(
+                "null_pair init from %s[%s]: norm %.1f",
+                dcfg.null_pair_init,
+                dcfg.null_pair_init_key,
+                float(head.null_pair.norm()),
+            )
+        head.null_pair_log_scale.requires_grad_(dcfg.null_pair_train == "all")
+        head.null_pair_dir.requires_grad_(dcfg.null_pair_train != "none")
 
     def _init_dataloaders(self) -> tuple[DataLoader, DataLoader | None]:
         """Thin wrapper around :func:`build_dataloaders`."""

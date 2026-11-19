@@ -474,6 +474,14 @@ class DiffusionConfig:
     # Changes the state dict (one extra parameter): starting a "learned" run
     # from a "zero" checkpoint needs ``load_strict: false``.
     cond_drop_fill: Literal["zero", "learned"] = "zero"
+    # "learned" only. ``null_pair_init``: a ``.pt`` dict of ``[c_pair]`` vectors (scripts/null_pair_stats.py
+    # writes ``mean_all`` / ``mean_intra`` / ``mean_inter``); a fresh run starts the fill at
+    # ``null_pair_init_key`` instead of zero (the trainer applies it after ``--params``; a resume keeps the
+    # checkpoint's). The fill is ``exp(log_scale) * direction``; ``null_pair_train`` picks what trains:
+    # "all", "direction" (scale fixed) or "none" (fixed fill).
+    null_pair_init: str | None = None
+    null_pair_init_key: str = "mean_all"
+    null_pair_train: Literal["all", "direction", "none"] = "all"
     # Fraction of drops that zero a random subset of INTER-CHAIN pair blocks
     # instead of the full ``cond_drop`` drop, so the model also learns
     # "these interfaces unconditioned, everything else conditioned" — what

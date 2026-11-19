@@ -503,7 +503,12 @@ class WrappedOptimizer:
         self._nan_accum: torch.Tensor | None = None
         self._nan_gather_buf: torch.Tensor | None = None
         self._grad_norm_gather_buf: torch.Tensor | None = None
-        self._null_pair = next((p for n, p in model.named_parameters() if n.endswith("diffusion_head.null_pair")), None)
+        # ``cond_drop_fill: learned``: the fill's direction and log scale (logged as one grad norm).
+        self._null_pair = [
+            p
+            for n, p in model.named_parameters()
+            if n.endswith(("diffusion_head.null_pair_dir", "diffusion_head.null_pair_log_scale"))
+        ]
         # Record ids of every sample that contributed to the current
         # accumulation window on THIS rank. Reset in ``step_or_skip`` so
         # each window starts empty; logged on NaN/Inf skip to identify
@@ -611,11 +616,12 @@ class WrappedOptimizer:
             # extra param sweep is needed. Outside per-rank mode the field
             # stays at its ``None`` default (never read by the trainer).
             state.last_grad_norm_global = _all_reduce_grads_(self.model.parameters(), self.dist.world_size).detach()
-        if self._null_pair is not None and self._null_pair.grad is not None:
+        grads = [p.grad for p in self._null_pair if p.grad is not None]
+        if grads:
             # The gradient the optimizer steps on: clipped, and averaged over
             # ranks (DDP's all-reduce, or the manual one above in per-rank-clip
             # mode), so it is the same on every rank.
-            state.last_null_pair_grad_norm = self._null_pair.grad.detach().float().norm()
+            state.last_null_pair_grad_norm = torch.cat([g.detach().float().reshape(-1) for g in grads]).norm()
         return grad_norm
 
     def step_or_skip(self, state: TrainState) -> StepResult:

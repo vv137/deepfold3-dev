@@ -932,8 +932,14 @@ class DiffusionHead(nn.Module):
             optim=optim,
         )
 
-        # Learned stand-in for dropped trunk-pair entries (``cond_drop_fill``).
-        self.null_pair = nn.Parameter(torch.zeros(c_pair)) if cfg.cond_drop_fill == "learned" else None
+        # Learned stand-in for dropped trunk-pair entries (``cond_drop_fill``), parametrised as
+        # ``exp(null_pair_log_scale) * null_pair_dir``: trunk pair entries have norms in the thousands
+        # while Adam moves a raw vector by ~lr per element, so a direction of unit-RMS elements plus a
+        # log scale can move at the trunk's scale. Zero-initialised (= the zero fill at step 0) unless
+        # ``init_null_pair`` sets it, e.g. to the mean trunk pair (``null_pair_init``).
+        if cfg.cond_drop_fill == "learned":
+            self.null_pair_dir = nn.Parameter(torch.zeros(c_pair))
+            self.null_pair_log_scale = nn.Parameter(torch.zeros(()))
 
         # Atom encoder (per-atom conditioning → token activations)
         self.atom_encoder = AtomEncoder(
@@ -982,6 +988,39 @@ class DiffusionHead(nn.Module):
             per_atom_pair_channels=cfg.atom_cross_att.per_atom_pair_channels,
             atom_transformer_num_blocks=cfg.atom_cross_att.atom_transformer.num_blocks,
         )
+
+    @property
+    def null_pair(self) -> torch.Tensor | None:
+        """The ``[c_pair]`` fill of a dropped trunk-pair entry (``cond_drop_fill: learned``), else None."""
+        if not hasattr(self, "null_pair_dir"):
+            return None
+        return self.null_pair_log_scale.exp() * self.null_pair_dir
+
+    @torch.no_grad()
+    def init_null_pair(self, vec: torch.Tensor) -> None:
+        """Set the learned fill to ``vec``: unit-RMS direction, log scale = log RMS(vec)."""
+        if not hasattr(self, "null_pair_dir"):
+            raise ValueError("init_null_pair needs cond_drop_fill: learned")
+        vec = vec.detach().float().to(self.null_pair_dir.device)
+        if vec.shape != self.null_pair_dir.shape:
+            raise ValueError(f"null_pair init has shape {tuple(vec.shape)}, expected {tuple(self.null_pair_dir.shape)}")
+        rms = vec.pow(2).mean().sqrt()
+        if rms > 0:
+            self.null_pair_log_scale.fill_(rms.log())
+            self.null_pair_dir.copy_(vec / rms)
+        else:
+            self.null_pair_log_scale.zero_()
+            self.null_pair_dir.zero_()
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        # Checkpoints from before the direction / log-scale split store the fill as one vector.
+        old = state_dict.pop(prefix + "null_pair", None)
+        if old is not None and hasattr(self, "null_pair_dir"):
+            rms = old.float().pow(2).mean().sqrt()
+            scale = rms if rms > 0 else torch.ones(())
+            state_dict[prefix + "null_pair_dir"] = (old.float() / scale).to(old.dtype)
+            state_dict[prefix + "null_pair_log_scale"] = scale.log() if rms > 0 else torch.zeros(())
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def compute_static(
         self,

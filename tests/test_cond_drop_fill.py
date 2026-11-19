@@ -13,7 +13,7 @@ from tests.test_diffusion_guidance import _asym, _head, _inputs, _static, _tiny_
 def test_default_fill_is_zero_and_has_no_parameter():
     assert DiffusionConfig().cond_drop_fill == "zero"
     assert _head().null_pair is None
-    assert "null_pair" not in dict(_head().named_parameters())
+    assert not any("null_pair" in n for n, _ in _head().named_parameters())
 
 
 def test_learned_fill_at_init_equals_zero_fill():
@@ -64,7 +64,7 @@ def test_null_pair_is_in_every_training_graph(use_conditioning):
     head, x = _head(cond_drop_fill="learned").train(), _inputs()
     st = head.compute_static(**x, use_conditioning=use_conditioning)
     (st.pair_cond.sum() + st.single_cond_pre_noise.sum()).backward()
-    g = head.null_pair.grad
+    g = head.null_pair_dir.grad
     assert g is not None
     assert bool(g.abs().sum() > 0) is (not use_conditioning)
 
@@ -73,7 +73,7 @@ def test_training_drop_through_forward_training_reaches_null_pair():
     torch.manual_seed(0)
     model = _tiny_model(use_conditioning_prob=0.0, cond_drop_interface_frac=1.0, cond_drop_fill="learned").train()
     with torch.no_grad():
-        model.diffusion_head.null_pair.normal_()
+        model.diffusion_head.null_pair_dir.normal_()
     batch = _tiny_batch()
     seen = {}
     orig = model.diffusion_head.sample_training
@@ -163,7 +163,7 @@ def test_wrapped_optimizer_records_null_pair_grad_norm():
         def __init__(self):
             super().__init__()
             self.diffusion_head = nn.Module()
-            self.diffusion_head.null_pair = nn.Parameter(torch.zeros(4))
+            self.diffusion_head.null_pair_dir = nn.Parameter(torch.zeros(4))
 
     model = M()
     opt = WrappedOptimizer(
@@ -174,7 +174,63 @@ def test_wrapped_optimizer_records_null_pair_grad_norm():
         dist_info=DistInfo(rank=0, world_size=1, local_rank=0, device=torch.device("cpu")),
         cfg=TrainingConfig(lr=1e-3, accumulate_grad_batches=1, grad_norm_fp64=True),
     )
-    (model.diffusion_head.null_pair * torch.tensor([3.0, 4.0, 0.0, 0.0])).sum().backward()
+    (model.diffusion_head.null_pair_dir * torch.tensor([3.0, 4.0, 0.0, 0.0])).sum().backward()
     state = TrainState()
     opt._unscale_clip_and_measure(state)
     assert torch.isclose(state.last_null_pair_grad_norm, torch.tensor(5.0))
+
+
+def test_init_null_pair_sets_the_fill_as_scale_times_unit_rms_direction():
+    head = _head(cond_drop_fill="learned")
+    vec = torch.randn(128) * 400.0 + 150.0
+    head.init_null_pair(vec)
+    assert torch.allclose(head.null_pair, vec, rtol=1e-5)
+    assert torch.isclose(head.null_pair_dir.pow(2).mean().sqrt(), torch.tensor(1.0), rtol=1e-5)
+    assert torch.isclose(head.null_pair_log_scale.exp(), vec.pow(2).mean().sqrt(), rtol=1e-5)
+    with pytest.raises(ValueError, match="shape"):
+        head.init_null_pair(torch.zeros(7))
+    with pytest.raises(ValueError, match="learned"):
+        _head().init_null_pair(vec)
+
+
+def test_a_single_vector_checkpoint_loads_into_direction_and_scale():
+    """Checkpoints written before the split store ``null_pair`` as one vector."""
+    head = _head(cond_drop_fill="learned")
+    vec = torch.linspace(-0.3, 0.2, 128)
+    sd = {k: v for k, v in head.state_dict().items() if "null_pair" not in k}
+    head.load_state_dict({**sd, "null_pair": vec})
+    assert torch.allclose(head.null_pair, vec, atol=1e-6)
+
+
+def test_the_log_scale_moves_the_fill_by_a_factor_per_step():
+    """Adam steps the log scale by ~lr, so the norm changes by a ratio, not by lr in absolute units."""
+    head = _head(cond_drop_fill="learned")
+    head.init_null_pair(torch.full((128,), 2000.0))
+    opt = torch.optim.Adam([head.null_pair_log_scale], lr=0.01)
+    before = float(head.null_pair.norm())
+    for _ in range(10):
+        opt.zero_grad()
+        head.null_pair.norm().backward()  # push the scale down
+        opt.step()
+    assert float(head.null_pair.norm()) == pytest.approx(before * float(torch.tensor(-0.1).exp()), rel=1e-3)
+
+
+@pytest.mark.parametrize(
+    ("train", "dir_grad", "scale_grad"), [("all", True, True), ("direction", True, False), ("none", False, False)]
+)
+def test_trainer_inits_from_file_and_freezes_per_null_pair_train(tmp_path, train, dir_grad, scale_grad):
+    from types import SimpleNamespace
+
+    from deepfold3.training.trainer import Trainer
+
+    model = _tiny_model(cond_drop_fill="learned")
+    c = model.diffusion_head.null_pair_dir.shape[0]
+    vec = torch.arange(c, dtype=torch.float32) + 1.0
+    path = tmp_path / "stats.pt"
+    torch.save({"mean_all": vec, "mean_inter": -vec}, path)
+    dcfg = SimpleNamespace(null_pair_init=str(path), null_pair_init_key="mean_inter", null_pair_train=train)
+    Trainer._init_null_pair(SimpleNamespace(model=model, model_cfg=SimpleNamespace(diffusion=dcfg)))
+    head = model.diffusion_head
+    assert torch.allclose(head.null_pair, -vec, rtol=1e-5)
+    assert head.null_pair_dir.requires_grad is dir_grad
+    assert head.null_pair_log_scale.requires_grad is scale_grad
