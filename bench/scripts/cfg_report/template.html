@@ -90,6 +90,8 @@ code { font-family: var(--f-mono); font-size: 0.9em; }
 .sel select { font: 13px var(--f-body); color: var(--fg); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; max-width: 100%; }
 .pt { stroke: var(--panel); stroke-width: 0.6; }
 .pt.up { fill: var(--good); } .pt.down { fill: var(--stop); } .pt.same { fill: var(--muted); }
+.tm { min-width: 0; width: 100%; font-size: 12px; margin-top: 6px; }
+.tm th, .tm td { padding: 3px 6px; }
 .diag { stroke: var(--fg); stroke-width: 1; opacity: 0.5; }
 .thr { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 3; }
 .ctrl { display: flex; flex-wrap: wrap; gap: 10px 24px; }
@@ -161,7 +163,7 @@ code { font-family: var(--f-mono); font-size: 0.9em; }
 
   <section>
     <h2>interface별 비교 (x = 기준, y = 비교 대상)</h2>
-    <p class="lede">점 하나가 interface 하나입니다. 대각선 위는 비교 대상이 더 좋은 interface, 아래는 더 나쁜 interface입니다. 점선은 성공 기준 DockQ 0.23입니다. 색은 |Δ| > 0.05 기준의 좋아짐 / 나빠짐입니다. Max(Oracle, 25개 중 최고)와 Mean(25개 평균)을 나란히, Conf(모델이 고른 1위)도 함께 그립니다.</p>
+    <p class="lede">점 하나가 interface 하나입니다. 대각선 위는 비교 대상이 더 좋은 interface, 아래는 더 나쁜 interface입니다. 점선은 DockQ 등급 경계 0.23 / 0.49 / 0.80입니다. 색은 |Δ| > 0.05 기준의 좋아짐 / 나빠짐입니다. Max(Oracle, 25개 중 최고)와 Mean(25개 평균)을 나란히, Conf(모델이 고른 1위)도 함께 그립니다.</p>
     <div class="tabs" role="tablist" data-group="sc-cat"></div>
     <div class="ctrl">
       <label class="sel">기준 (x) <select id="sc-x"></select></label>
@@ -460,7 +462,8 @@ let scCat = null;
 function drawScatter() {
   const P = DATA.points[scCat], xs = P.series[document.getElementById("sc-x").value], ys = P.series[document.getElementById("sc-y").value];
   const host = document.getElementById("scatter"); host.innerHTML = "";
-  const W = 320, H = 320, m = 38, T = 0.23;
+  const W = 320, H = 320, m = 38, T = 0.23, CUTS = [0.23, 0.49, 0.80], CAT = ["incorrect", "acceptable", "medium", "high"];
+  const cat = v => CUTS.filter(c => v >= c).length;
   const X = v => m + v * (W - m - 10), Y = v => H - m - v * (H - m - 10);
   let caption = [];
   for (const [mi, title] of SC_METRICS) {
@@ -477,19 +480,23 @@ function drawScatter() {
     axis.appendChild(el("text", { x: 10, y: (Y(0) + Y(1)) / 2, "text-anchor": "middle", class: "axis-title", transform: `rotate(-90 10 ${(Y(0) + Y(1)) / 2})` }, "비교 DockQ"));
     svg.appendChild(grid); svg.appendChild(axis);
     svg.appendChild(el("line", { class: "diag", x1: X(0), y1: Y(0), x2: X(1), y2: Y(1) }));
-    svg.appendChild(el("line", { class: "thr", x1: X(T), x2: X(T), y1: Y(0), y2: Y(1) }));
-    svg.appendChild(el("line", { class: "thr", x1: X(0), x2: X(1), y1: Y(T), y2: Y(T) }));
+    for (const c of CUTS) {
+      svg.appendChild(el("line", { class: "thr", x1: X(c), x2: X(c), y1: Y(0), y2: Y(1) }));
+      svg.appendChild(el("line", { class: "thr", x1: X(0), x2: X(1), y1: Y(c), y2: Y(c) }));
+    }
     const tip = document.createElement("div"); tip.className = "tip"; tip.hidden = true;
-    let up = 0, down = 0, same = 0, gain = 0, loss = 0, n = 0;
+    let up = 0, down = 0, same = 0, gain = 0, loss = 0, n = 0, cup = 0, cdown = 0;
+    const tm = [0, 1, 2, 3].map(() => [0, 0, 0, 0]);
     P.keys.forEach((k, i) => {
       if (!xs || !ys || !xs[i] || !ys[i]) return;
       const a = xs[i][mi], b = ys[i][mi], d = b - a; n++;
       const cls = d > 0.05 ? "up" : d < -0.05 ? "down" : "same";
       if (cls === "up") up++; else if (cls === "down") down++; else same++;
       if (a < T && b >= T) gain++; if (a >= T && b < T) loss++;
+      const ca = cat(a), cb = cat(b); tm[ca][cb]++; if (cb > ca) cup++; if (cb < ca) cdown++;
       const c = el("circle", { cx: X(a), cy: Y(b), r: 2.6, class: `pt ${cls}` });
       c.addEventListener("mouseenter", ev => {
-        tip.textContent = `${k}\n기준 ${a.toFixed(3)} → 비교 ${b.toFixed(3)} (${d >= 0 ? "+" : ""}${d.toFixed(3)})`;
+        tip.textContent = `${k}\n기준 ${a.toFixed(3)} (${CAT[cat(a)]}) → 비교 ${b.toFixed(3)} (${CAT[cat(b)]})\nΔ ${d >= 0 ? "+" : ""}${d.toFixed(3)}`;
         tip.hidden = false;
         const bx = box.getBoundingClientRect();
         tip.style.left = Math.min(ev.clientX - bx.left + 10, bx.width - 200) + "px"; tip.style.top = (ev.clientY - bx.top + 10) + "px";
@@ -497,11 +504,18 @@ function drawScatter() {
       c.addEventListener("mouseleave", () => { tip.hidden = true; });
       svg.appendChild(c);
     });
-    box.innerHTML = `<h3>${title}</h3><p class="caption"><span class="up">▲ ${up}</span> · <span class="down">▼ ${down}</span> · ±0.05 안 ${same} · 성공 전환 <span class="up">+${gain}</span> / <span class="down">−${loss}</span></p>`;
-    box.appendChild(svg); box.appendChild(tip); host.appendChild(box);
+    box.innerHTML = `<h3>${title}</h3><p class="caption"><span class="up">▲ ${up}</span> · <span class="down">▼ ${down}</span> · ±0.05 안 ${same} · 등급 <span class="up">↑${cup}</span> / <span class="down">↓${cdown}</span> · 성공 전환 <span class="up">+${gain}</span> / <span class="down">−${loss}</span></p>`;
+    box.appendChild(svg); box.appendChild(tip);
+    const short = ["inc", "acc", "med", "high"];
+    let t = `<table class="tm"><thead><tr><th class="l">기준 ↓ / 비교 →</th>${short.map(c => `<th>${c}</th>`).join("")}<th>계</th></tr></thead><tbody>`;
+    tm.forEach((r, i) => {
+      t += `<tr><th class="l">${short[i]}</th>` + r.map((v, j) => `<td class="num ${j > i && v ? "up" : j < i && v ? "down" : "dim"}">${v}</td>`).join("") + `<td class="num dim">${r.reduce((x, y) => x + y, 0)}</td></tr>`;
+    });
+    const wrap = document.createElement("div"); wrap.className = "tmw"; wrap.innerHTML = t + "</tbody></table>";
+    box.appendChild(wrap); host.appendChild(box);
     caption.push(n);
   }
-  document.getElementById("cap-sc").textContent = `두 series가 모두 가진 interface ${caption[0] || 0}개. ▲/▼: 비교 − 기준 > +0.05 / < −0.05. 성공 전환: 0.23을 넘거나 내려간 interface 수.`;
+  document.getElementById("cap-sc").textContent = `두 series가 모두 가진 interface ${caption[0] || 0}개. ▲/▼: 비교 − 기준 > +0.05 / < −0.05. 성공 전환: 0.23을 넘거나 내려간 interface 수. 점선은 DockQ 등급 경계 0.23 / 0.49 / 0.80 (incorrect · acceptable · medium · high); 표는 기준 등급(행) → 비교 등급(열), 대각선 위가 등급 상승.`;
 }
 
 function setupScatter() {
