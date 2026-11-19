@@ -82,3 +82,15 @@ def test_split_chunks_gives_ordinary_runs_and_null_counts():
     assert len(passes) == 5 and all(len(p[key]) == 25 for p in passes)
     assert {s.sample for s in passes[1][key]} == set(range(5, 10))
     assert A.null_rescue(passes, [key]) == [(1, 0), (0, 0), (0, 0), (0, 0)]
+
+
+def test_pooled_emax_matches_enumeration_and_single_series():
+    key = ("x", "A", "B")
+    a = {key: _samples([0.1, 0.5, 0.2, 0.9, 0.3])}
+    b = {key: _samples([0.4, 0.05, 0.6, 0.2, 0.15])}
+    assert A.pooled_emax([a], [key], 3) == pytest.approx(A.emax_at([s.dockq for s in a[key]], 3))
+    va, vb = [s.dockq for s in a[key]], [s.dockq for s in b[key]]
+    want = sum(max(x + y) for x in itertools.combinations(va, 2) for y in itertools.combinations(vb, 2))
+    want /= len(list(itertools.combinations(va, 2))) * len(list(itertools.combinations(vb, 2)))
+    assert A.pooled_emax([a, b], [key], 4) == pytest.approx(want)
+    assert A.pooled_emax([a, b], [key], 3) is None

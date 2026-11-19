@@ -158,7 +158,14 @@ def many_samples(cat: str) -> dict | None:
         c = A.curves(d, keys)
         lines.append({"node": n, "pass": [round(x, 2) for x in c["pass"]], "emax": [round(x, 4) for x in c["emax"]]})
         ks = list(range(5, 126, 5))
-        pooled.append({"node": n, "k": ks, "pass": [round(A.pooled_pass(pools[n], keys, k), 2) for k in ks]})
+        pooled.append(
+            {
+                "node": n,
+                "k": ks,
+                "pass": [round(A.pooled_pass(pools[n], keys, k), 2) for k in ks],
+                "emax": [round(A.pooled_emax(pools[n], keys, k), 4) for k in ks],
+            }
+        )
     return {"common": len(keys), "total": A.TOTAL_INTERFACES[cat], "pool_w": POOL_W, "lines": lines, "pooled": pooled}
 
 

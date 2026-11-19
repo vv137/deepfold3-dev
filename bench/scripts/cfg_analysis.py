@@ -180,6 +180,32 @@ def pooled_pass(ds: list[dict[Interface, list[Sample]]], keys: list[Interface], 
     return 100 * tot / len(keys)
 
 
+def pooled_emax(ds: list[dict[Interface, list[Sample]]], keys: list[Interface], k: int) -> float | None:
+    """E[best DockQ] when k samples are split evenly over the series in ``ds`` (exact), averaged over keys.
+
+    Each series contributes k/len(ds) draws without replacement; the draws are independent across
+    series, so P(max <= t) is the product of each series' C(#<=t, kw) / C(n, kw).
+    """
+    if k % len(ds):
+        return None
+    kw = k // len(ds)
+    tot = 0.0
+    for key in keys:
+        vals = [sorted(s.dockq for s in d[key]) for d in ds]
+        if any(kw > len(v) for v in vals):
+            return None
+        grid = sorted({x for v in vals for x in v})
+        prev, e = 0.0, 0.0
+        for t in grid:
+            f = 1.0
+            for v in vals:
+                f *= comb(sum(x <= t for x in v), kw) / comb(len(v), kw)
+            e += t * (f - prev)
+            prev = f
+        tot += e
+    return tot / len(keys)
+
+
 @dataclass
 class Rescue:
     key: Interface

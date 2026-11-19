@@ -169,6 +169,7 @@ code { font-family: var(--f-mono); font-size: 0.9em; }
     <h2>W = 1을 125개까지 뽑으면</h2>
     <p class="lede">seed 5개 × seed당 25개(<code>--sample-chunk 5</code>) = interface당 125개에서, k개를 뽑았을 때 하나라도 성공(DockQ ≥ 0.23)할 확률을 정확히 계산했습니다. x축은 log scale입니다. 점선은 같은 샘플 수를 W 0.6 / 0.8 / 1 / 2 / 3(full drop) 다섯 개에 똑같이 나눠 뽑은 W-pooling으로, 같은 seed(같은 trunk)를 씁니다.</p>
     <div class="tabs" role="tablist" data-group="many"></div>
+    <div class="tabs" role="tablist" id="many-metric"></div>
     <div class="curves" id="many"></div>
     <div class="legend" id="many-legend"></div>
     <p class="caption" id="cap-many"></p>
@@ -555,28 +556,34 @@ function setupScatter() {
 }
 
 const MCOL = { s3: "var(--m-s3)", fz: "var(--m-fz)", fl: "var(--m-fl)" };
+let manyCat = null, manyMetric = "pass";
 function drawMany(cat) {
+  cat = cat || manyCat; manyCat = cat;
   const M = DATA.many[cat], host = document.getElementById("many"); host.innerHTML = "";
+  const key = manyMetric, pct = key === "pass", step = pct ? 5 : 0.05, fmt = v => pct ? v.toFixed(1) : v.toFixed(3);
   const W = 640, H = 300, ml = 44, mr = 16, mt = 10, mb = 36, kmax = 125;
   const lx = k => Math.log(k), X = k => ml + lx(k) / lx(kmax) * (W - ml - mr);
-  const all = M.lines.flatMap(l => l.pass).concat(M.pooled.flatMap(p => p.pass));
-  const [y0, y1] = niceRange(all, 5), Y = v => mt + (1 - (v - y0) / (y1 - y0)) * (H - mt - mb);
+  const all = M.lines.flatMap(l => l[key]).concat(M.pooled.flatMap(p => p[key]));
+  const [y0, y1] = niceRange(all, step), Y = v => mt + (1 - (v - y0) / (y1 - y0)) * (H - mt - mb);
   const box = document.createElement("div"); box.className = "chart"; box.style.gridColumn = "1 / -1";
   const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": `${cat} best-of-k to 125` });
   const grid = el("g", { class: "grid" }), axis = el("g", { class: "axis" });
-  for (let v = y0; v <= y1 + 1e-9; v += 5) {
+  for (let v = y0; v <= y1 + 1e-9; v += step) {
     grid.appendChild(el("line", { x1: ml, x2: W - mr, y1: Y(v), y2: Y(v) }));
-    axis.appendChild(el("text", { x: ml - 6, y: Y(v) + 3, "text-anchor": "end" }, v.toFixed(0)));
+    axis.appendChild(el("text", { x: ml - 6, y: Y(v) + 3, "text-anchor": "end" }, pct ? v.toFixed(0) : v.toFixed(2)));
   }
   for (const k of [1, 2, 5, 10, 25, 50, 125]) {
     grid.appendChild(el("line", { x1: X(k), x2: X(k), y1: mt, y2: H - mb }));
     axis.appendChild(el("text", { x: X(k), y: H - mb + 14, "text-anchor": "middle" }, k));
   }
   axis.appendChild(el("text", { x: (ml + W - mr) / 2, y: H - 4, "text-anchor": "middle", class: "axis-title" }, "샘플 수 k (log)"));
-  axis.appendChild(el("text", { x: 12, y: (mt + H - mb) / 2, "text-anchor": "middle", class: "axis-title", transform: `rotate(-90 12 ${(mt + H - mb) / 2})` }, "성공률 %"));
+  axis.appendChild(el("text", { x: 12, y: (mt + H - mb) / 2, "text-anchor": "middle", class: "axis-title", transform: `rotate(-90 12 ${(mt + H - mb) / 2})` }, pct ? "성공률 %" : "기대 최고 DockQ"));
   svg.appendChild(grid); svg.appendChild(axis);
-  for (const l of M.lines) svg.appendChild(el("polyline", { class: "cl", stroke: MCOL[l.node], points: l.pass.map((v, i) => `${X(i + 1).toFixed(1)},${Y(v).toFixed(1)}`).join(" ") }));
-  for (const p of M.pooled) svg.appendChild(el("polyline", { class: "cl dash", stroke: MCOL[p.node], points: p.k.map((k, i) => `${X(k).toFixed(1)},${Y(p.pass[i]).toFixed(1)}`).join(" ") }));
+  for (const l of M.lines) {
+    svg.appendChild(el("polyline", { class: "cl", stroke: MCOL[l.node], points: l[key].map((v, i) => `${X(i + 1).toFixed(1)},${Y(v).toFixed(1)}`).join(" ") }));
+    if (!pct) svg.appendChild(el("line", { class: "thr", stroke: MCOL[l.node], x1: X(1), x2: X(kmax), y1: Y(l.emax[0]), y2: Y(l.emax[0]) }));
+  }
+  for (const p of M.pooled) svg.appendChild(el("polyline", { class: "cl dash", stroke: MCOL[p.node], points: p.k.map((k, i) => `${X(k).toFixed(1)},${Y(p[key][i]).toFixed(1)}`).join(" ") }));
   const vline = el("line", { class: "vline", y1: mt, y2: H - mb, x1: -10, x2: -10 }); svg.appendChild(vline);
   const hit = el("rect", { class: "hit", x: ml, y: mt, width: W - ml - mr, height: H - mt - mb }); svg.appendChild(hit);
   const tip = document.createElement("div"); tip.className = "tip"; tip.hidden = true;
@@ -586,8 +593,9 @@ function drawMany(cat) {
     vline.setAttribute("x1", X(k)); vline.setAttribute("x2", X(k));
     const kp = Math.max(5, Math.round(k / 5) * 5);
     tip.textContent = `k = ${k}\n` + M.lines.map(l => {
-      const p = M.pooled.find(q => q.node === l.node), pv = p.pass[p.k.indexOf(Math.min(125, kp))];
-      return `${NODES[l.node].short.padEnd(20)} W=1 ${l.pass[k - 1].toFixed(1)}   pool@${Math.min(125, kp)} ${pv.toFixed(1)}`;
+      const p = M.pooled.find(q => q.node === l.node);
+      const pv2 = p[key][p.k.indexOf(Math.min(125, kp))];
+      return `${NODES[l.node].short.padEnd(20)} W=1 ${fmt(l[key][k - 1])}   pool@${Math.min(125, kp)} ${fmt(pv2)}` + (pct ? "" : `   mean ${fmt(l.emax[0])}`);
     }).join("\n");
     tip.hidden = false;
     const bx = box.getBoundingClientRect();
@@ -597,11 +605,19 @@ function drawMany(cat) {
   box.appendChild(svg); box.appendChild(tip); host.appendChild(box);
   document.getElementById("many-legend").innerHTML = M.lines.map(l => `<span class="key"><i style="background:${MCOL[l.node]}"></i>${NODES[l.node].short}</span>`).join("") +
     `<span class="key"><i style="background:linear-gradient(90deg,var(--muted) 60%,transparent 60%);background-size:8px 3px"></i>점선: W-pooling (${M.pool_w.join(" / ")})</span>`;
-  document.getElementById("cap-many").textContent = `공통 interface ${M.common}개 (전체 ${M.total}개). 실선 k = 1 … 125, 점선 k = 5, 10, …, 125.`;
+  document.getElementById("cap-many").textContent = `공통 interface ${M.common}개 (전체 ${M.total}개). 실선 k = 1 … 125, 점선 k = 5, 10, …, 125.` +
+    (pct ? "" : " 기대 최고 DockQ = k개 중 최고값의 기댓값(interface 평균); 가는 점선 가로선은 각 모델의 Mean DockQ(= k = 1).");
 }
 
 function setupMany() {
   if (!DATA.many || !Object.keys(DATA.many).length) return;
+  const mb = document.getElementById("many-metric");
+  for (const [k, label] of [["pass", "성공률 (DockQ ≥ 0.23)"], ["emax", "DockQ: 기대 최고 (max) · Mean"]]) {
+    const b = document.createElement("button"); b.type = "button"; b.role = "tab"; b.textContent = label;
+    b.setAttribute("aria-selected", String(k === manyMetric));
+    b.addEventListener("click", () => { manyMetric = k; mb.querySelectorAll("button").forEach(x => x.setAttribute("aria-selected", String(x === b))); drawMany(); });
+    mb.appendChild(b);
+  }
   const bar = document.querySelector('.tabs[data-group="many"]');
   Object.keys(DATA.many).forEach((cat, i) => {
     const b = document.createElement("button"); b.type = "button"; b.role = "tab"; b.textContent = cat;
