@@ -110,6 +110,10 @@ code { font-family: var(--f-mono); font-size: 0.9em; }
 .vline { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 3; }
 .key { display: inline-flex; align-items: center; gap: 6px; }
 .key i { width: 18px; height: 3px; border-radius: 2px; display: inline-block; }
+:root { --m-s3: #2b6cb0; --m-fz: #b4541f; --m-fl: #6d4bb8; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --m-s3: #7fb0e8; --m-fz: #f0a06e; --m-fl: #b8a0f0; } }
+:root[data-theme="dark"] { --m-s3: #7fb0e8; --m-fz: #f0a06e; --m-fl: #b8a0f0; }
+.cl.dash { stroke-dasharray: 5 4; }
 :root { --w04: #2b5f9e; --w06: #4a8fd1; --w08: #8cc0ea; --w1: #59616b; --w2: #e8a36b; --w3: #c0612b; }
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --w04: #6fa3e6; --w06: #8fbdf0; --w08: #bcdaf6; --w1: #b5bdc7; --w2: #f0b98a; --w3: #e5864f; } }
 :root[data-theme="dark"] { --w04: #6fa3e6; --w06: #8fbdf0; --w08: #bcdaf6; --w1: #b5bdc7; --w2: #f0b98a; --w3: #e5864f; }
@@ -159,6 +163,15 @@ code { font-family: var(--f-mono); font-size: 0.9em; }
     <div class="curves" id="curves"></div>
     <div class="legend" id="curve-legend"></div>
     <p class="caption" id="cap-curve"></p>
+  </section>
+
+  <section>
+    <h2>W = 1을 125개까지 뽑으면</h2>
+    <p class="lede">seed 5개 × seed당 25개(<code>--sample-chunk 5</code>) = interface당 125개에서, k개를 뽑았을 때 하나라도 성공(DockQ ≥ 0.23)할 확률을 정확히 계산했습니다. x축은 log scale입니다. 점선은 같은 샘플 수를 W 0.6 / 0.8 / 1 / 2 / 3(full drop) 다섯 개에 똑같이 나눠 뽑은 W-pooling으로, 같은 seed(같은 trunk)를 씁니다.</p>
+    <div class="tabs" role="tablist" data-group="many"></div>
+    <div class="curves" id="many"></div>
+    <div class="legend" id="many-legend"></div>
+    <p class="caption" id="cap-many"></p>
   </section>
 
   <section>
@@ -541,6 +554,65 @@ function setupScatter() {
   sx.addEventListener("change", drawScatter); sy.addEventListener("change", drawScatter);
 }
 
+const MCOL = { s3: "var(--m-s3)", fz: "var(--m-fz)", fl: "var(--m-fl)" };
+function drawMany(cat) {
+  const M = DATA.many[cat], host = document.getElementById("many"); host.innerHTML = "";
+  const W = 640, H = 300, ml = 44, mr = 16, mt = 10, mb = 36, kmax = 125;
+  const lx = k => Math.log(k), X = k => ml + lx(k) / lx(kmax) * (W - ml - mr);
+  const all = M.lines.flatMap(l => l.pass).concat(M.pooled.flatMap(p => p.pass));
+  const [y0, y1] = niceRange(all, 5), Y = v => mt + (1 - (v - y0) / (y1 - y0)) * (H - mt - mb);
+  const box = document.createElement("div"); box.className = "chart"; box.style.gridColumn = "1 / -1";
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": `${cat} best-of-k to 125` });
+  const grid = el("g", { class: "grid" }), axis = el("g", { class: "axis" });
+  for (let v = y0; v <= y1 + 1e-9; v += 5) {
+    grid.appendChild(el("line", { x1: ml, x2: W - mr, y1: Y(v), y2: Y(v) }));
+    axis.appendChild(el("text", { x: ml - 6, y: Y(v) + 3, "text-anchor": "end" }, v.toFixed(0)));
+  }
+  for (const k of [1, 2, 5, 10, 25, 50, 125]) {
+    grid.appendChild(el("line", { x1: X(k), x2: X(k), y1: mt, y2: H - mb }));
+    axis.appendChild(el("text", { x: X(k), y: H - mb + 14, "text-anchor": "middle" }, k));
+  }
+  axis.appendChild(el("text", { x: (ml + W - mr) / 2, y: H - 4, "text-anchor": "middle", class: "axis-title" }, "샘플 수 k (log)"));
+  axis.appendChild(el("text", { x: 12, y: (mt + H - mb) / 2, "text-anchor": "middle", class: "axis-title", transform: `rotate(-90 12 ${(mt + H - mb) / 2})` }, "성공률 %"));
+  svg.appendChild(grid); svg.appendChild(axis);
+  for (const l of M.lines) svg.appendChild(el("polyline", { class: "cl", stroke: MCOL[l.node], points: l.pass.map((v, i) => `${X(i + 1).toFixed(1)},${Y(v).toFixed(1)}`).join(" ") }));
+  for (const p of M.pooled) svg.appendChild(el("polyline", { class: "cl dash", stroke: MCOL[p.node], points: p.k.map((k, i) => `${X(k).toFixed(1)},${Y(p.pass[i]).toFixed(1)}`).join(" ") }));
+  const vline = el("line", { class: "vline", y1: mt, y2: H - mb, x1: -10, x2: -10 }); svg.appendChild(vline);
+  const hit = el("rect", { class: "hit", x: ml, y: mt, width: W - ml - mr, height: H - mt - mb }); svg.appendChild(hit);
+  const tip = document.createElement("div"); tip.className = "tip"; tip.hidden = true;
+  hit.addEventListener("mousemove", ev => {
+    const r = svg.getBoundingClientRect(), sx = (ev.clientX - r.left) / r.width * W;
+    const k = Math.min(kmax, Math.max(1, Math.round(Math.exp((sx - ml) / (W - ml - mr) * lx(kmax)))));
+    vline.setAttribute("x1", X(k)); vline.setAttribute("x2", X(k));
+    const kp = Math.max(5, Math.round(k / 5) * 5);
+    tip.textContent = `k = ${k}\n` + M.lines.map(l => {
+      const p = M.pooled.find(q => q.node === l.node), pv = p.pass[p.k.indexOf(Math.min(125, kp))];
+      return `${NODES[l.node].short.padEnd(20)} W=1 ${l.pass[k - 1].toFixed(1)}   pool@${Math.min(125, kp)} ${pv.toFixed(1)}`;
+    }).join("\n");
+    tip.hidden = false;
+    const bx = box.getBoundingClientRect();
+    tip.style.left = Math.min(ev.clientX - bx.left + 12, bx.width - 360) + "px"; tip.style.top = (ev.clientY - bx.top + 12) + "px";
+  });
+  hit.addEventListener("mouseleave", () => { tip.hidden = true; vline.setAttribute("x1", -10); vline.setAttribute("x2", -10); });
+  box.appendChild(svg); box.appendChild(tip); host.appendChild(box);
+  document.getElementById("many-legend").innerHTML = M.lines.map(l => `<span class="key"><i style="background:${MCOL[l.node]}"></i>${NODES[l.node].short}</span>`).join("") +
+    `<span class="key"><i style="background:linear-gradient(90deg,var(--muted) 60%,transparent 60%);background-size:8px 3px"></i>점선: W-pooling (${M.pool_w.join(" / ")})</span>`;
+  document.getElementById("cap-many").textContent = `공통 interface ${M.common}개 (전체 ${M.total}개). 실선 k = 1 … 125, 점선 k = 5, 10, …, 125.`;
+}
+
+function setupMany() {
+  if (!DATA.many || !Object.keys(DATA.many).length) return;
+  const bar = document.querySelector('.tabs[data-group="many"]');
+  Object.keys(DATA.many).forEach((cat, i) => {
+    const b = document.createElement("button"); b.type = "button"; b.role = "tab"; b.textContent = cat;
+    b.addEventListener("click", () => {
+      bar.querySelectorAll("button").forEach(x => x.setAttribute("aria-selected", "false"));
+      b.setAttribute("aria-selected", "true"); drawMany(cat);
+    });
+    bar.appendChild(b); if (i === 0) b.click();
+  });
+}
+
 function setupRescue() {
   if (!DATA.rescues || !DATA.rescues.length) return;
   const bar = document.querySelector('.tabs[data-group="rescue"]');
@@ -563,4 +635,5 @@ setupTabs("sweep", DATA.tables.filter(t => t.kind === "sweep"), true);
 setupCurves();
 setupRescue();
 setupScatter();
+setupMany();
 </script>

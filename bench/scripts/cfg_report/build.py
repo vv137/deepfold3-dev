@@ -137,6 +137,31 @@ def points(cat: str) -> dict:
     return {"keys": [f"{k[0]} {k[1]}:{k[2]}" for k in keys], "series": out}
 
 
+POOL_W = ["0.6", "0.8", "1", "2.0", "3.0"]
+
+
+def many_samples(cat: str) -> dict | None:
+    """best-of-k to 125 samples for each model's W = 1 x125 run, and W-pooling at the same budget.
+
+    Pooling splits k evenly over the full-drop series at POOL_W (25 samples each, same seeds), so
+    its curve exists at k = 5, 10, ..., 125. One interface set: those every series has in full.
+    """
+    big = {n: A.load(f"{MODELS[n][0]}-cfg-w1n125", cat, samples=125) for n in MODELS}
+    big = {n: d for n, d in big.items() if len(d) >= A.TOTAL_INTERFACES[cat] / 2}
+    if not big:
+        return None
+    pools = {n: [A.load(series_for(n, "full", w), cat) for w in POOL_W] for n in big}
+    sets = [set(d) for d in big.values()] + [set(d) for ds in pools.values() for d in ds]
+    keys = sorted(set.intersection(*sets))
+    lines, pooled = [], []
+    for n, d in big.items():
+        c = A.curves(d, keys)
+        lines.append({"node": n, "pass": [round(x, 2) for x in c["pass"]], "emax": [round(x, 4) for x in c["emax"]]})
+        ks = list(range(5, 126, 5))
+        pooled.append({"node": n, "k": ks, "pass": [round(A.pooled_pass(pools[n], keys, k), 2) for k in ks]})
+    return {"common": len(keys), "total": A.TOTAL_INTERFACES[cat], "pool_w": POOL_W, "lines": lines, "pooled": pooled}
+
+
 def build() -> dict:
     tables, curves, rescues = [], [], []
     for cat, label, scopes in CATEGORIES:
@@ -162,12 +187,14 @@ def build() -> dict:
                 if r := rescue_set(node, scope, cat):
                     rescues.append({"cat": label, **r})
     pts = {label: points(cat) for cat, label, _ in CATEGORIES}
+    many = {label: m for cat, label, _ in CATEGORIES if (m := many_samples(cat))}
     return {
         "built": time.strftime("%Y-%m-%d %H:%M KST"),
         "tables": tables,
         "curves": curves,
         "rescues": rescues,
         "points": pts,
+        "many": many,
     }
 
 
