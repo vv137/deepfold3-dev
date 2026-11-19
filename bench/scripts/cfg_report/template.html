@@ -1,0 +1,452 @@
+<title>Frozen-Trunk CFG FoldBench</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+KR:wght@400;500;600&family=Instrument+Sans:wght@500;600;700&display=swap">
+<style>
+/* Layout: one reading column; lineage graph first, then the unguided baseline, then the W sweeps per category. */
+:root {
+  --bg: #f6f7f8; --panel: #ffffff; --fg: #1c2430; --muted: #5d6877; --line: #d9dee5;
+  --accent: #1f6f8b; --accent-soft: #dcecf2; --warn: #a15c07; --warn-soft: #fbefdc;
+  --good: #2e7d4f; --stop: #9a3b3b;
+  --f-display: "Instrument Sans", "IBM Plex Sans KR", system-ui, sans-serif;
+  --f-body: "IBM Plex Sans KR", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --f-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #12161c; --panel: #1a2029; --fg: #e3e8ee; --muted: #98a3b1; --line: #2c3542;
+  --accent: #5fb3cf; --accent-soft: #1d3440; --warn: #e0a24a; --warn-soft: #3a2c17;
+  --good: #6cc191; --stop: #e08585; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #12161c; --panel: #1a2029; --fg: #e3e8ee; --muted: #98a3b1; --line: #2c3542;
+  --accent: #5fb3cf; --accent-soft: #1d3440; --warn: #e0a24a; --warn-soft: #3a2c17;
+  --good: #6cc191; --stop: #e08585; color-scheme: dark }
+body { background: var(--bg); color: var(--fg); font-family: var(--f-body); font-size: 15px; line-height: 1.55; }
+.wrap { max-width: 1120px; margin: 0 auto; padding-block: 32px 64px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: flex; flex-direction: column; gap: 40px; }
+h1, h2, h3 { font-family: var(--f-display); text-wrap: balance; margin: 0; letter-spacing: -0.01em; }
+h1 { font-size: 1.9rem; font-weight: 700; }
+h2 { font-size: 1.3rem; font-weight: 600; }
+h3 { font-size: 1.02rem; font-weight: 600; }
+p { margin: 0; max-width: 68ch; }
+header { display: flex; flex-direction: column; gap: 10px; }
+.meta { font-family: var(--f-mono); font-size: 12px; color: var(--muted); letter-spacing: 0.02em; }
+section { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.lede { color: var(--muted); }
+.graph { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow-x: auto; padding: 8px; }
+.graph svg { display: block; min-width: 820px; width: 100%; height: auto; }
+.node rect { fill: var(--panel); stroke: var(--line); stroke-width: 1.2; }
+.node.bench rect { stroke: var(--accent); stroke-width: 1.6; }
+.node.stopped rect { stroke: var(--stop); stroke-dasharray: 5 4; }
+.n-title { font-family: var(--f-mono); font-size: 12.5px; font-weight: 500; fill: var(--fg); }
+.n-sub { font-family: var(--f-body); font-size: 11px; fill: var(--muted); }
+.n-chip { font-family: var(--f-mono); font-size: 10.5px; }
+.chip-bg { fill: var(--accent-soft); }
+.chip-tx { fill: var(--accent); }
+.chip-bg.no { fill: var(--warn-soft); } .chip-tx.no { fill: var(--warn); }
+.chip-bg.stop { fill: var(--warn-soft); } .chip-tx.stop { fill: var(--stop); }
+.edge { fill: none; stroke: var(--muted); stroke-width: 1.4; }
+.edge.dashed { stroke-dasharray: 5 4; stroke: var(--stop); }
+.e-label { font-family: var(--f-body); font-size: 10.5px; fill: var(--muted); }
+.arrow { fill: var(--muted); }
+.legend { display: flex; flex-wrap: wrap; gap: 8px 18px; font-size: 12.5px; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.sw { width: 18px; height: 11px; border-radius: 3px; border: 1.6px solid var(--accent); display: inline-block; }
+.sw.stop { border-color: var(--stop); border-style: dashed; }
+.tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+.tabs button { font: 500 13px var(--f-body); color: var(--muted); background: transparent; border: 1px solid var(--line);
+  border-radius: 999px; padding: 5px 14px; cursor: pointer; }
+.tabs button:disabled { opacity: 0.4; cursor: default; }
+.tabs button[aria-selected="true"] { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.tabs button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.tbl { overflow-x: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+table { border-collapse: collapse; width: 100%; min-width: 860px; font-size: 13px; }
+th, td { padding: 7px 10px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--line); }
+th { font-weight: 600; font-size: 11.5px; color: var(--muted); letter-spacing: 0.03em; vertical-align: bottom; }
+thead tr:first-child th { border-bottom: none; padding-bottom: 0; }
+th.grp { text-align: center; color: var(--fg); }
+td.l, th.l { text-align: left; }
+td.num { font-family: var(--f-mono); font-variant-numeric: tabular-nums; }
+td.dim { color: var(--muted); }
+tr.base td { background: var(--accent-soft); }
+tr.groupstart td { border-top: 2px solid var(--line); }
+td.best { font-weight: 600; color: var(--accent); }
+.pending { color: var(--warn); font-family: var(--f-body); font-size: 12px; }
+.model { font-weight: 500; }
+.dag { color: var(--warn); font-weight: 600; }
+.caption { font-size: 12.5px; color: var(--muted); }
+.notes { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px 28px; }
+.notes div { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.notes b { font-family: var(--f-display); font-weight: 600; font-size: 13.5px; }
+.notes p { font-size: 13.5px; color: var(--muted); }
+code { font-family: var(--f-mono); font-size: 0.9em; }
+.rs table { min-width: 0; font-size: 12.5px; }
+.rs td, .rs th { padding: 5px 8px; }
+.rs details { font-size: 12px; color: var(--muted); }
+.rs summary { cursor: pointer; color: var(--fg); }
+.rs .lst { font-family: var(--f-mono); font-size: 11.5px; line-height: 1.6; white-space: normal; text-align: left; }
+.up { color: var(--good); } .down { color: var(--stop); }
+.ctrl { display: flex; flex-wrap: wrap; gap: 10px 24px; }
+.curves { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
+.chart { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 10px 4px; min-width: 0; position: relative; }
+.chart h3 { font-size: 13.5px; margin: 2px 4px 6px; }
+.chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+.grid line { stroke: var(--line); stroke-width: 1; }
+.axis text { font-family: var(--f-mono); font-size: 10px; fill: var(--muted); }
+.axis-title { font-family: var(--f-body); font-size: 10.5px; fill: var(--muted); }
+.cl { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.cl.base { stroke-width: 3; }
+.hit { fill: transparent; cursor: crosshair; }
+.tip { position: absolute; pointer-events: none; background: var(--fg); color: var(--bg); font: 12px var(--f-mono);
+  padding: 6px 8px; border-radius: 6px; white-space: pre; z-index: 2; }
+.vline { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 3; }
+.key { display: inline-flex; align-items: center; gap: 6px; }
+.key i { width: 18px; height: 3px; border-radius: 2px; display: inline-block; }
+:root { --w04: #2b5f9e; --w06: #4a8fd1; --w08: #8cc0ea; --w1: #59616b; --w2: #e8a36b; --w3: #c0612b; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --w04: #6fa3e6; --w06: #8fbdf0; --w08: #bcdaf6; --w1: #b5bdc7; --w2: #f0b98a; --w3: #e5864f; } }
+:root[data-theme="dark"] { --w04: #6fa3e6; --w06: #8fbdf0; --w08: #bcdaf6; --w1: #b5bdc7; --w2: #f0b98a; --w3: #e5864f; }
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="meta" id="built"></div>
+    <h1>Frozen-trunk CFG: FoldBench 인터페이스 결과</h1>
+    <p class="lede">stage3-s1-001 5k의 trunk·confidence·distogram을 고정하고 diffusion head만 conditioning drop으로 5k step 더 학습한 두 run(zero / learned fill)을, 시작점과 메인 라인과 같은 interface 집합 위에서 비교합니다. 채점이 진행되는 동안 숫자는 바뀝니다.</p>
+  </header>
+
+  <section>
+    <h2>체크포인트 계보</h2>
+    <div class="graph"><svg id="lineage" viewBox="0 0 900 360" role="img" aria-label="체크포인트 계보 그래프"></svg></div>
+    <div class="legend">
+      <span><i class="sw"></i>이 페이지에서 채점한 체크포인트</span>
+      <span><i class="sw stop"></i>중단된 run (채점 안 함)</span>
+      <span>칩: CFG 가능 여부 · 수집된 interface (AbAg / PPI)</span>
+    </div>
+  </section>
+
+  <section>
+    <h2>Guidance 없이 (W = 1)</h2>
+    <p class="lede">모든 체크포인트의 unguided 결과. 공통 interface 집합은 절반 이상 수집된 행끼리 잡습니다.</p>
+    <div class="tabs" role="tablist" data-group="base"></div>
+    <div class="tbl" id="tbl-base"></div>
+    <p class="caption" id="cap-base"></p>
+  </section>
+
+  <section>
+    <h2>Guidance sweep</h2>
+    <p class="lede">W는 guidance scale, Drop은 unconditional branch가 비우는 범위입니다. 각 모델 묶음의 W = 1 행(색 띠)은 같은 모델의 unguided 결과입니다.</p>
+    <div class="tabs" role="tablist" data-group="sweep"></div>
+    <div class="tbl" id="tbl-sweep"></div>
+    <p class="caption" id="cap-sweep"></p>
+  </section>
+
+  <section>
+    <h2>샘플을 늘릴 때 최고점이 오르는 속도</h2>
+    <p class="lede">interface마다 25개 샘플 중 k개를 무작위로 뽑았을 때의 기대값(조합식으로 정확히 계산, 재표본 잡음 없음). k = 1은 Mean, k = 25는 Oracle과 같습니다. 기준선은 같은 모델의 W = 1(굵은 회색)입니다. Seed 축은 seed 단위(seed당 5개 샘플 전부)로 뽑은 값으로, trunk를 몇 번 돌리느냐에 해당합니다.</p>
+    <div class="tabs" role="tablist" data-group="curve"></div>
+    <div class="ctrl">
+      <div class="tabs" role="tablist" id="metric-tabs"></div>
+      <div class="tabs" role="tablist" id="axis-tabs"></div>
+    </div>
+    <div class="curves" id="curves"></div>
+    <div class="legend" id="curve-legend"></div>
+    <p class="caption" id="cap-curve"></p>
+  </section>
+
+  <section>
+    <h2>W = 1이 못 푼 interface를 다른 W가 푸는 경우</h2>
+    <p class="lede">Oracle 기준(25개 중 하나라도 DockQ ≥ 0.23). <b>살아남</b>은 같은 모델의 W = 1에서 실패하고 그 W에서 성공한 interface, <b>잃음</b>은 반대입니다. 두 수가 비슷하면 기준선 근처 interface가 샘플링 운으로 넘나든 것에 가깝습니다. 각 행을 열면 interface별 최고 DockQ(성공 샘플 수)가 W = 1 → W로 나옵니다.</p>
+    <div class="tabs" role="tablist" data-group="rescue"></div>
+    <div class="curves" id="rescue"></div>
+  </section>
+
+  <section>
+    <h2>읽는 법</h2>
+    <div class="notes">
+      <div><b>Oracle / Conf / Mean</b><p>interface마다 25개 샘플(seed 5 × sample 5) 중 정답 기준 최고 DockQ / ranking_score(0.8·ipTM + 0.2·pTM) 1위 샘플의 DockQ(동점은 평균) / 25개 평균. Succ는 그 DockQ가 0.23 이상인 interface의 비율(%).</p></div>
+      <div><b>Drop 범위</b><p><code>full</code>: trunk pair 전체를 fill 값으로. <code>abag</code>: 항체–항원 체인 쌍 블록만. <code>all</code>: 모든 체인 간 블록. learned 모델은 비운 자리에 학습된 <code>null_pair</code> 벡터가 들어갑니다.</p></div>
+      <div><b>†와 공통 집합</b><p>†는 그 행의 interface가 아직 다 수집되지 않았다는 뜻입니다. 숫자는 표 안의 모든 (충분히 수집된) 행이 가진 interface만으로 계산하므로, 같은 표 안에서는 직접 비교할 수 있습니다. 먼저 끝나는 쪽이 큰 target이라 중간 집합은 큰 target으로 치우쳐 있습니다.</p></div>
+      <div><b>채점 코드</b><p>OST 2.11.1, eval_ost e35cde9(reference 체인으로 interface 매칭). stage1·stage2는 예전 OST 결과를 이 코드로 다시 집계한 값(<code>-rescore</code>)입니다.</p></div>
+      <div><b>Confidence head</b><p>frozen 두 run은 stage3-s1-001의 confidence head를 그대로 씁니다. Conf 열은 구조 생성과 샘플 선택 차이가 섞인 값이고, Oracle·Mean은 선택과 무관합니다.</p></div>
+      <div><b>굵은 값</b><p>표 안 각 열의 최댓값(공통 집합 기준).</p></div>
+    </div>
+  </section>
+</div>
+
+<script>
+const DATA = /*__DATA__*/null;
+
+const NODES = {
+  s1:   { x: 20,  y: 150, run: "stage1 120k", sub: "crop 512 · cond drop 없음", cfg: false, bench: true, short: "stage1 120k", trunk: "stage1" },
+  s2:   { x: 330, y: 20,  run: "df3-stage2-001 50k", sub: "crop 512 · cond drop 20%", cfg: true, bench: true, short: "stage2 50k", trunk: "s1→s2" },
+  s3:   { x: 640, y: 20,  run: "df3-stage3-001 5k", sub: "crop 640 · cond drop 20% · 메인", cfg: true, bench: true, short: "stage3 5k (메인)", trunk: "s1→s2→s3" },
+  s3s1: { x: 330, y: 150, run: "stage3-s1-001 5k", sub: "crop 640 · cond drop 없음", cfg: false, bench: true, short: "stage3-s1 5k (시작점)", trunk: "s1→s3" },
+  fz:   { x: 640, y: 150, run: "frozen-cfg-zero-001 5k", sub: "trunk 고정 · fill = 0", cfg: true, bench: true, short: "frozen CFG · zero", trunk: "s1→s3 (고정)" },
+  fl:   { x: 640, y: 270, run: "frozen-cfg-learned-001 5k", sub: "trunk 고정 · fill = null_pair", cfg: true, bench: true, short: "frozen CFG · learned", trunk: "s1→s3 (고정)" },
+  core: { x: 330, y: 270, run: "stage3-s1-core-001", sub: "core loss · 2912에서 중단", cfg: false, bench: false, stopped: true },
+};
+const EDGES = [
+  { a: "s1", b: "s2", label: ["stage2.yaml · 50k step", "64 노드 × 1"] },
+  { a: "s2", b: "s3", label: ["stage3.yaml · 5k", "64 × 1"] },
+  { a: "s1", b: "s3s1", label: ["stage3-from-stage1 · 5k", "64 × 1"] },
+  { a: "s3s1", b: "fz", label: ["frozen-cfg · 5k", "32 × 2 · MSE+bond"] },
+  { a: "s3s1", b: "fl", label: ["frozen-cfg-learned · 5k", "32 × 2"] },
+  { a: "s1", b: "core", label: ["core-loss · NCCL 타임아웃", "(Lustre 장애)"], dashed: true },
+];
+const W = 200, H = 78;
+
+function collected(node) {
+  const out = {};
+  for (const t of DATA.tables.filter(t => t.kind === "base")) {
+    const r = t.rows.find(r => r.node === node);
+    if (r) out[t.cat] = `${r.collected}/${r.total}`;
+  }
+  return out;
+}
+
+function el(tag, attrs, text) {
+  const e = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [k, v] of Object.entries(attrs || {})) e.setAttribute(k, v);
+  if (text != null) e.textContent = text;
+  return e;
+}
+
+function drawGraph() {
+  const svg = document.getElementById("lineage");
+  const defs = el("defs");
+  const m = el("marker", { id: "arr", viewBox: "0 0 10 10", refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse" });
+  m.appendChild(el("path", { d: "M0,0 L10,5 L0,10 z", class: "arrow" }));
+  defs.appendChild(m); svg.appendChild(defs);
+  for (const e of EDGES) {
+    const A = NODES[e.a], B = NODES[e.b];
+    const x1 = A.x + W, y1 = A.y + H / 2, x2 = B.x, y2 = B.y + H / 2;
+    const mx = (x1 + x2) / 2;
+    svg.appendChild(el("path", { d: `M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2 - 2},${y2}`, class: "edge" + (e.dashed ? " dashed" : ""), "marker-end": "url(#arr)" }));
+    const ly = y2 === y1 ? y1 - 22 : (y2 < y1 ? y2 + 20 : y2 - 34);
+    const lx = y2 === y1 ? mx : x2 - 52;
+    e.label.forEach((s, i) => svg.appendChild(el("text", { x: lx, y: ly + i * 13, class: "e-label", "text-anchor": "middle" }, s)));
+  }
+  for (const [id, n] of Object.entries(NODES)) {
+    const g = el("g", { class: "node" + (n.bench ? " bench" : "") + (n.stopped ? " stopped" : ""), transform: `translate(${n.x},${n.y})` });
+    g.appendChild(el("rect", { width: W, height: H, rx: 8 }));
+    g.appendChild(el("text", { x: 12, y: 20, class: "n-title" }, n.run));
+    g.appendChild(el("text", { x: 12, y: 37, class: "n-sub" }, n.sub));
+    let cx = 12;
+    const chip = (txt, cls) => {
+      const w = txt.length * 6.4 + 12;
+      g.appendChild(el("rect", { x: cx, y: 50, width: w, height: 18, rx: 9, class: "chip-bg " + cls }));
+      g.appendChild(el("text", { x: cx + 6, y: 63, class: "n-chip chip-tx " + cls }, txt));
+      cx += w + 6;
+    };
+    if (n.stopped) chip("중단", "stop");
+    else chip(n.cfg ? "CFG ✓" : "CFG ✗", n.cfg ? "" : "no");
+    if (n.bench) { const c = collected(id); chip(`${c.AbAg || "–"} · ${c.PPI || "–"}`, ""); }
+    svg.appendChild(g);
+  }
+}
+
+const COLS = [["oracle", "Oracle"], ["conf", "Conf"], ["mean", "Mean"]];
+const SCOPE_LABEL = { none: "—", full: "full", abag: "abag", all: "all" };
+
+function renderTable(t, host, cap, isSweep) {
+  const best = {};
+  for (const [k] of COLS) for (const f of ["dq", "succ"]) {
+    const v = t.rows.map(r => r[`${k}_${f}`]).filter(v => v != null);
+    best[`${k}_${f}`] = v.length ? Math.max(...v) : null;
+  }
+  let h = `<table><thead><tr><th class="l" rowspan="2">모델</th><th class="l" rowspan="2">Trunk</th>` +
+    (isSweep ? `<th rowspan="2">W</th><th class="l" rowspan="2">Drop</th>` : "") +
+    `<th rowspan="2">수집</th>` + COLS.map(([, n]) => `<th class="grp" colspan="2">${n}</th>`).join("") +
+    `</tr><tr>` + COLS.map(() => `<th>DockQ</th><th>Succ %</th>`).join("") + `</tr></thead><tbody>`;
+  let prev = null;
+  for (const r of t.rows) {
+    const n = NODES[r.node];
+    const dag = r.collected < r.total ? ' <span class="dag">†</span>' : "";
+    const cls = [isSweep && r.w === "1" ? "base" : "", isSweep && prev && prev !== r.node ? "groupstart" : ""].join(" ");
+    prev = r.node;
+    h += `<tr class="${cls}"><td class="l model">${n.short}${dag}</td><td class="l dim">${n.trunk}</td>` +
+      (isSweep ? `<td class="num">${r.w}</td><td class="l dim">${SCOPE_LABEL[r.scope]}</td>` : "") +
+      `<td class="num dim">${r.collected}/${r.total}</td>`;
+    if (r.conf_dq == null) {
+      h += `<td class="l pending" colspan="6">${r.collected ? "수집 중 (절반 미만)" : "아직 없음"}</td>`;
+    } else {
+      for (const [k] of COLS) for (const f of ["dq", "succ"]) {
+        const v = r[`${k}_${f}`];
+        h += `<td class="num${v === best[`${k}_${f}`] ? " best" : ""}">${f === "dq" ? v.toFixed(3) : v.toFixed(1)}</td>`;
+      }
+    }
+    h += `</tr>`;
+  }
+  host.innerHTML = h + `</tbody></table>`;
+  cap.textContent = `공통 interface ${t.common}개 (전체 ${t.total}개) 기준.`;
+}
+
+function setupTabs(group, tables, isSweep) {
+  const bar = document.querySelector(`.tabs[data-group="${group}"]`);
+  const host = document.getElementById(`tbl-${group}`), cap = document.getElementById(`cap-${group}`);
+  tables.forEach((t, i) => {
+    const b = document.createElement("button");
+    b.type = "button"; b.role = "tab"; b.id = `tab-${t.id}`;
+    b.textContent = isSweep ? `${t.cat} · drop ${t.scope}` : t.cat;
+    b.addEventListener("click", () => {
+      bar.querySelectorAll("button").forEach(x => x.setAttribute("aria-selected", "false"));
+      b.setAttribute("aria-selected", "true");
+      renderTable(t, host, cap, isSweep);
+    });
+    bar.appendChild(b);
+    if (i === 0) b.click();
+  });
+}
+
+const WCOL = { "-0.3": "var(--w04)", "0": "var(--w04)", "0.4": "var(--w04)", "0.6": "var(--w06)", "0.8": "var(--w08)", "1": "var(--w1)", "2": "var(--w2)", "3": "var(--w3)" };
+const METRICS = [["pass", "성공률 %", "pass_seed"], ["emax", "기대 최고 DockQ", null]];
+const AXES = [["k", "샘플 수 k"], ["seed", "seed 수 j"]];
+let curveState = { set: null, metric: "pass", axis: "k" };
+
+function niceRange(vals, step) {
+  const lo = Math.floor(Math.min(...vals) / step) * step, hi = Math.ceil(Math.max(...vals) / step) * step;
+  return [lo, hi === lo ? lo + step : hi];
+}
+
+function drawCurves() {
+  const host = document.getElementById("curves");
+  const sets = DATA.curves.filter(c => c.cat === curveState.set.cat && c.scope === curveState.set.scope);
+  const axisSeed = curveState.axis === "seed";
+  if (axisSeed && curveState.metric === "emax") curveState.metric = "pass";
+  document.querySelectorAll("#metric-tabs button").forEach(b => {
+    b.disabled = axisSeed && b.dataset.k === "emax";
+    b.setAttribute("aria-selected", String(b.dataset.k === curveState.metric));
+  });
+  const key = axisSeed ? "pass_seed" : curveState.metric;
+  const isPct = key !== "emax";
+  const all = sets.flatMap(s => s.lines.flatMap(l => l[key]));
+  const [y0, y1] = niceRange(all, isPct ? 5 : 0.05);
+  const W = 340, H = 230, ml = 40, mr = 12, mt = 10, mb = 34;
+  const n = axisSeed ? 5 : 25;
+  const X = k => ml + (k - 1) / (n - 1) * (W - ml - mr);
+  const Y = v => mt + (1 - (v - y0) / (y1 - y0)) * (H - mt - mb);
+  host.innerHTML = "";
+  for (const s of sets) {
+    const box = document.createElement("div"); box.className = "chart";
+    box.innerHTML = `<h3>${NODES[s.node].short}</h3>`;
+    const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": `${NODES[s.node].short} best-of-k` });
+    const grid = el("g", { class: "grid" }), axis = el("g", { class: "axis" });
+    const ystep = isPct ? (y1 - y0 > 40 ? 10 : 5) : 0.05;
+    for (let v = y0; v <= y1 + 1e-9; v += ystep) {
+      grid.appendChild(el("line", { x1: ml, x2: W - mr, y1: Y(v), y2: Y(v) }));
+      axis.appendChild(el("text", { x: ml - 6, y: Y(v) + 3, "text-anchor": "end" }, isPct ? v.toFixed(0) : v.toFixed(2)));
+    }
+    const ticks = axisSeed ? [1, 2, 3, 4, 5] : [1, 5, 10, 15, 20, 25];
+    for (const k of ticks) axis.appendChild(el("text", { x: X(k), y: H - mb + 14, "text-anchor": "middle" }, k));
+    axis.appendChild(el("text", { x: (ml + W - mr) / 2, y: H - 4, "text-anchor": "middle", class: "axis-title" }, axisSeed ? "seed 수 j" : "샘플 수 k"));
+    svg.appendChild(grid); svg.appendChild(axis);
+    for (const l of s.lines) {
+      const pts = l[key].map((v, i) => `${X(i + 1).toFixed(1)},${Y(v).toFixed(1)}`).join(" ");
+      svg.appendChild(el("polyline", { points: pts, class: "cl" + (l.w === "1" ? " base" : ""), stroke: WCOL[l.w] || "var(--muted)" }));
+      const last = l[key][n - 1];
+      svg.appendChild(el("circle", { cx: X(n), cy: Y(last), r: 3, fill: WCOL[l.w] || "var(--muted)" }));
+    }
+    const vline = el("line", { class: "vline", y1: mt, y2: H - mb, x1: -10, x2: -10 });
+    svg.appendChild(vline);
+    const hit = el("rect", { class: "hit", x: ml, y: mt, width: W - ml - mr, height: H - mt - mb });
+    svg.appendChild(hit);
+    const tip = document.createElement("div"); tip.className = "tip"; tip.hidden = true;
+    hit.addEventListener("mousemove", ev => {
+      const r = svg.getBoundingClientRect();
+      const sx = (ev.clientX - r.left) / r.width * W;
+      const k = Math.min(n, Math.max(1, Math.round((sx - ml) / (W - ml - mr) * (n - 1) + 1)));
+      vline.setAttribute("x1", X(k)); vline.setAttribute("x2", X(k));
+      const base = s.lines.find(l => l.w === "1")[key][k - 1];
+      tip.textContent = `${axisSeed ? "seed" : "k"} = ${k}\n` + s.lines.slice().reverse().map(l => {
+        const v = l[key][k - 1], d = v - base;
+        return `W ${l.w.padEnd(4)} ${isPct ? v.toFixed(1) : v.toFixed(3)}${l.w === "1" ? "  (기준)" : `  ${d >= 0 ? "+" : ""}${isPct ? d.toFixed(1) : d.toFixed(3)}`}`;
+      }).join("\n");
+      tip.hidden = false;
+      const bx = box.getBoundingClientRect();
+      tip.style.left = Math.min(ev.clientX - bx.left + 12, bx.width - 170) + "px";
+      tip.style.top = (ev.clientY - bx.top + 12) + "px";
+    });
+    hit.addEventListener("mouseleave", () => { tip.hidden = true; vline.setAttribute("x1", -10); vline.setAttribute("x2", -10); });
+    box.appendChild(svg); box.appendChild(tip); host.appendChild(box);
+  }
+  const ws = [...new Set(sets.flatMap(s => s.lines.map(l => l.w)))].sort((a, b) => a - b);
+  document.getElementById("curve-legend").innerHTML = ws.map(w =>
+    `<span class="key"><i style="background:${WCOL[w] || "var(--muted)"};${w === "1" ? "height:4px" : ""}"></i>W ${w}${w === "1" ? " (기준)" : ""}</span>`).join("");
+  const c = sets[0];
+  document.getElementById("cap-curve").textContent = c ? `공통 interface ${c.common}개 (전체 ${c.total}개), Drop = ${c.scope}. 성공 = DockQ ≥ 0.23. 마우스를 올리면 W = 1 대비 차이가 나옵니다.` : "";
+}
+
+function setupCurves() {
+  if (!DATA.curves || !DATA.curves.length) return;
+  const bar = document.querySelector('.tabs[data-group="curve"]');
+  const keys = [...new Map(DATA.curves.map(c => [`${c.cat}|${c.scope}`, c])).values()];
+  keys.forEach((c, i) => {
+    const b = document.createElement("button"); b.type = "button"; b.role = "tab";
+    b.textContent = `${c.cat} · drop ${c.scope}`;
+    b.addEventListener("click", () => {
+      bar.querySelectorAll("button").forEach(x => x.setAttribute("aria-selected", "false"));
+      b.setAttribute("aria-selected", "true"); curveState.set = c; drawCurves();
+    });
+    bar.appendChild(b); if (i === 0) { b.setAttribute("aria-selected", "true"); curveState.set = c; }
+  });
+  const mk = (hostId, items, field) => {
+    const h = document.getElementById(hostId);
+    for (const [k, label] of items) {
+      const b = document.createElement("button"); b.type = "button"; b.role = "tab"; b.dataset.k = k; b.textContent = label;
+      b.setAttribute("aria-selected", String(curveState[field] === k));
+      b.addEventListener("click", () => {
+        if (b.disabled) return;
+        curveState[field] = k;
+        h.querySelectorAll("button").forEach(x => x.setAttribute("aria-selected", String(x.dataset.k === k)));
+        drawCurves();
+      });
+      h.appendChild(b);
+    }
+  };
+  mk("metric-tabs", METRICS.map(m => [m[0], m[1]]), "metric");
+  mk("axis-tabs", AXES, "axis");
+  drawCurves();
+}
+
+function drawRescue(cat, scope) {
+  const host = document.getElementById("rescue");
+  host.innerHTML = "";
+  for (const r of DATA.rescues.filter(x => x.cat === cat && x.scope === scope)) {
+    const box = document.createElement("div"); box.className = "chart rs";
+    const fmt = it => `${it[0]} ${it[1].toFixed(2)}(${it[2]})→${it[3].toFixed(2)}(${it[4]})`;
+    let h = `<h3>${NODES[r.node].short}</h3><table><thead><tr><th class="l">W</th><th>W=1 실패</th><th>살아남</th><th>잃음</th><th>순</th></tr></thead><tbody>`;
+    for (const x of r.rows) {
+      const net = x.rescued.length - x.lost.length;
+      h += `<tr><td class="l num">${x.w}</td><td class="num dim">${x.fail}/${x.n}</td><td class="num up">+${x.rescued.length}</td>` +
+        `<td class="num down">−${x.lost.length}</td><td class="num ${net > 0 ? "up" : net < 0 ? "down" : ""}">${net > 0 ? "+" : ""}${net}</td></tr>` +
+        `<tr><td colspan="5" class="lst"><details><summary>목록</summary>` +
+        `<div><b class="up">살아남</b> ${x.rescued.map(fmt).join("; ") || "없음"}</div>` +
+        `<div><b class="down">잃음</b> ${x.lost.map(fmt).join("; ") || "없음"}</div></details></td></tr>`;
+    }
+    box.innerHTML = h + "</tbody></table>";
+    host.appendChild(box);
+  }
+}
+
+function setupRescue() {
+  if (!DATA.rescues || !DATA.rescues.length) return;
+  const bar = document.querySelector('.tabs[data-group="rescue"]');
+  const keys = [...new Map(DATA.rescues.map(c => [`${c.cat}|${c.scope}`, c])).values()];
+  keys.forEach((c, i) => {
+    const b = document.createElement("button"); b.type = "button"; b.role = "tab";
+    b.textContent = `${c.cat} · drop ${c.scope}`;
+    b.addEventListener("click", () => {
+      bar.querySelectorAll("button").forEach(x => x.setAttribute("aria-selected", "false"));
+      b.setAttribute("aria-selected", "true"); drawRescue(c.cat, c.scope);
+    });
+    bar.appendChild(b); if (i === 0) b.click();
+  });
+}
+
+document.getElementById("built").textContent = `중간 집계 · ${DATA.built} 기준`;
+drawGraph();
+setupTabs("base", DATA.tables.filter(t => t.kind === "base"), false);
+setupTabs("sweep", DATA.tables.filter(t => t.kind === "sweep"), true);
+setupCurves();
+setupRescue();
+</script>
