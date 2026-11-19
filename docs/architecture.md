@@ -384,6 +384,11 @@ every guidance setting of the line's sweep group from it, each one identical to 
 separate run with that guidance. Inputs-file lines take `key=value` columns: `group=`
 (the sweep group), `seeds=` (fold only these seeds, so a large target can be split
 across GPUs) and `pairs=` (fills `{pairs}` in the group's guidance values).
+`--sample-chunk C` (default 5) bounds the diffusion batch: `--num-samples N` above C is drawn
+from the one trunk in passes of C samples, pass 0 seeded with the model seed and pass c with
+`sample_chunk_seed(seed, c)`, numbered `sample-0 .. N-1` across passes and resumed per pass. The
+first C samples are a run with `--num-samples C`; the rest depend on C. 25 samples in one pass do
+not fit a 95 GB GH200 on the largest FoldBench targets.
 
 ### Distance restraints (`model/restraints.py`)
 

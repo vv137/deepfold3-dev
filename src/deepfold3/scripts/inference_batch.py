@@ -153,6 +153,7 @@ def _run_one_job(
     num_samples: int,
     seeds: list[int],
     template_cache: Path | None,
+    sample_chunk: int | None = None,
     pdb_mmcif_dir: Path | None,
     plot_confidences: bool,
     msa_pairing: str = "auto",
@@ -322,21 +323,34 @@ def _run_one_job(
     kernel_census.reset_counts()
 
     summaries: list[list[dict]] = [[] for _ in entries]
+    total = num_samples  # samples per seed on disk
+    chunks = sample_chunks(num_samples, sample_chunk)
+    chunk = chunks[0][2]
 
     for current_seed in seed_list:
         # Judge a seed on every file it owes, not just model.cif: a run killed
         # between the structure and its confidences would otherwise be "done"
         # with the rest missing for good.
-        todo = []
+        todo = []  # (entry, batch) pairs still owed
         for k, (name, od, _) in enumerate(entries):
-            if skip_existing and all(p.exists() for p in _seed_outputs(od, current_seed, num_samples, save_distogram)):
+            if skip_existing and all(p.exists() for p in _seed_outputs(od, current_seed, total, save_distogram)):
                 click.echo(f"[batch]   {name + ' ' if name else ''}seed {current_seed}: complete — skip")
-                summaries[k] += _existing_summaries(od, current_seed, num_samples)
-            else:
-                todo.append(k)
+                summaries[k] += _existing_summaries(od, current_seed, total)
+                continue
+            for c, start, size in chunks:
+                done = skip_existing and all(
+                    p.exists() for p in _seed_outputs(od, current_seed, size, save_distogram and c == 0, start)
+                )
+                if done:
+                    summaries[k] += _existing_summaries(od, current_seed, size, start)
+                else:
+                    todo.append((k, c, start, size))
         if not todo:
             continue
-        click.echo(f"[batch] {json_input.name}  seed={current_seed} samples={num_samples} recycles={num_recycles}")
+        passes = f" in {len(chunks)} passes of {chunk}" if len(chunks) > 1 else ""
+        click.echo(
+            f"[batch] {json_input.name}  seed={current_seed} samples={num_samples}{passes} recycles={num_recycles}"
+        )
         t0 = time.perf_counter()
         with (
             torch.inference_mode(),
@@ -351,7 +365,7 @@ def _run_one_job(
         if len(entries) > 1:
             click.echo(f"  trunk {time.perf_counter() - t0:.1f}s")
         distogram = None
-        for k in todo:
+        for k, c, start, size in todo:
             name, od, _ = entries[k]
             t1 = time.perf_counter()
             with (
@@ -361,8 +375,8 @@ def _run_one_job(
                 model_output = model.sample_from_trunk(
                     feats,
                     trunk,
-                    seed=current_seed,
-                    num_samples=num_samples,
+                    seed=sample_chunk_seed(current_seed, c),
+                    num_samples=size,
                     guidance_terms=entry_terms[k],
                     restraints=restraints,
                     restraint_weight=restraint_weight,
@@ -380,15 +394,16 @@ def _run_one_job(
 
                 model_output = unpad_output(model_output, original_n)
                 iter_feats = unpad_features(feats, original_n)
-            label = f"{name} " if name else ""
+            label = (f"{name} " if name else "") + (f"chunk {c} " if len(chunks) > 1 else "")
             click.echo(f"  {label}done in {time.perf_counter() - (t1 if len(entries) > 1 else t0):.1f}s")
             summaries[k] += _save_seed(
                 od,
                 model_output,
                 iter_feats,
                 current_seed,
-                num_samples,
-                save_distogram=save_distogram,
+                size,
+                sample_offset=start,
+                save_distogram=save_distogram and c == 0,
                 logits_scheme=logits_scheme,
                 plot_confidences=plot_confidences,
                 entity_descriptions=entity_descriptions,
@@ -409,7 +424,7 @@ def _run_one_job(
     for k, (_, od, _) in enumerate(entries):
         if sweep is not None and seeds and len(seed_list) == 1:
             # Other jobs hold the other seeds of this directory: list every seed on disk.
-            summaries[k] = _all_summaries_on_disk(od, num_samples)
+            summaries[k] = _all_summaries_on_disk(od, total)
         if summaries[k]:
             save_ranking_scores_csv(od / "ranking_scores.csv", summaries[k])
             summary_name = f"{job_name}_summary_confidences.json" if job_name else "summary_confidences.json"
@@ -428,6 +443,7 @@ def _save_seed(
     seed: int,
     num_samples: int,
     *,
+    sample_offset: int = 0,
     save_distogram: bool,
     logits_scheme: str,
     plot_confidences: bool,
@@ -448,7 +464,7 @@ def _save_seed(
 
     out = []
     for s in range(num_samples):
-        sample_dir = output_dir / f"seed-{int(seed)}_sample-{int(s)}"
+        sample_dir = output_dir / f"seed-{int(seed)}_sample-{int(s + sample_offset)}"
         sample_dir.mkdir(parents=True, exist_ok=True)
         save_mmcif(
             sample_dir / "model.cif",
@@ -468,12 +484,27 @@ def _save_seed(
             seed=int(seed),
             chain_names=chain_names,
         )
-        out.append({**summary, "seed": int(seed), "sample": int(s)})
+        out.append({**summary, "seed": int(seed), "sample": int(s + sample_offset)})
         if plot_confidences:
             from deepfold3.scripts.plot_confidences import plot_confidences_file
 
             plot_confidences_file(conf_path, conf_path.with_suffix(".png"))
     return out
+
+
+def sample_chunks(num_samples: int, chunk: int | None) -> list[tuple[int, int, int]]:
+    """``(chunk index, first sample index, size)`` of each diffusion pass; ``chunk=None`` is one pass."""
+    size = min(chunk or num_samples, num_samples)
+    return [(c, c * size, min(size, num_samples - c * size)) for c in range(-(-num_samples // size))]
+
+
+def sample_chunk_seed(seed: int, chunk: int) -> int:
+    """Diffusion-noise seed of sample chunk ``chunk`` of model seed ``seed``; chunk 0 is the seed itself.
+
+    Later chunks step by a large prime so they do not land on another model seed's chunk 0 in the usual
+    seed ranges, and stay well below 2**63 for ``torch.Generator.manual_seed``.
+    """
+    return int(seed) + 1_000_003 * int(chunk)
 
 
 def _all_summaries_on_disk(output_dir: Path, num_samples: int) -> list[dict]:
@@ -489,18 +520,18 @@ def _all_summaries_on_disk(output_dir: Path, num_samples: int) -> list[dict]:
     return out
 
 
-def _seed_outputs(output_dir: Path, seed: int, num_samples: int, save_distogram: bool) -> list[Path]:
-    """Every file one seed of a job must leave behind, in write order."""
+def _seed_outputs(output_dir: Path, seed: int, num_samples: int, save_distogram: bool, start: int = 0) -> list[Path]:
+    """Every file one seed of a job must leave behind (samples ``start .. start+num_samples-1``), in write order."""
     out: list[Path] = []
     if save_distogram:
         out.append(output_dir / f"seed-{int(seed)}_distogram.npz")
-    for s in range(num_samples):
+    for s in range(start, start + num_samples):
         d = output_dir / f"seed-{int(seed)}_sample-{int(s)}"
         out += [d / "model.cif", d / "confidences.json"]
     return out
 
 
-def _existing_summaries(output_dir: Path, seed: int, num_samples: int) -> list[dict]:
+def _existing_summaries(output_dir: Path, seed: int, num_samples: int, start: int = 0) -> list[dict]:
     """The per-sample summaries of a seed already on disk.
 
     ``ranking_scores.csv`` and ``summary_confidences.json`` cover the whole job,
@@ -512,7 +543,7 @@ def _existing_summaries(output_dir: Path, seed: int, num_samples: int) -> list[d
             summary, which means the skip decision was wrong.
     """
     out = []
-    for s in range(num_samples):
+    for s in range(start, start + num_samples):
         path = output_dir / f"seed-{int(seed)}_sample-{int(s)}" / "confidences.json"
         try:
             summary = json.loads(path.read_text())["summary"]
@@ -637,6 +668,17 @@ def _sweep_entries(
 )
 @click.option("--num-recycles", default=10, show_default=True)
 @click.option("--num-samples", default=5, show_default=True)
+@click.option(
+    "--sample-chunk",
+    default=5,
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Samples per diffusion pass. The trunk runs once per seed and the --num-samples samples are drawn "
+    "in passes of this many, so a large --num-samples fits in memory (5 fits on the largest FoldBench targets "
+    "on a 95 GB GH200, 25 does not). Pass 0 is seeded "
+    "with the model seed, pass c > 0 with sample_chunk_seed(seed, c): the first chunk matches a run of "
+    "--num-samples equal to the chunk size, but the full set depends on the chunk size.",
+)
 @click.option("--snapshot", type=click.Choice(["auto", "shadow", "average", "fast"]), default="auto", show_default=True)
 @click.option(
     "--seed",
@@ -847,6 +889,7 @@ def inference_batch(
     msa_crop_size: int | None,
     num_recycles: int,
     num_samples: int,
+    sample_chunk: int | None,
     snapshot: str,
     seeds: tuple[int, ...],
     device: str | None,
@@ -955,6 +998,7 @@ def inference_batch(
         "gpu": gpu_name(dev),
         "checkpoint": checkpoint,
         "num_samples": num_samples,
+        "sample_chunk": sample_chunk or num_samples,
         "num_recycles": num_recycles,
         "msa_crop_size": model_cfg.msa_crop_size,
         "bucket": bucket or model_cfg.optim.use_torch_compile,
@@ -1003,6 +1047,7 @@ def inference_batch(
                 od,
                 num_recycles=num_recycles,
                 num_samples=num_samples,
+                sample_chunk=sample_chunk,
                 seeds=job_seeds,
                 template_cache=template_cache,
                 pdb_mmcif_dir=pdb_mmcif_dir,
