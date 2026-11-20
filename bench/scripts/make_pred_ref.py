@@ -30,11 +30,13 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
-BENCH = REPO / "bench"
+# DF3_BENCH: bench tree (runs/, data/) to read and write; defaults to this checkout's.
+BENCH = Path(os.environ["DF3_BENCH"]) if os.environ.get("DF3_BENCH") else REPO / "bench"
 _SEED_SAMPLE = re.compile(r"seed-(\d+)_sample-(\d+)")
 
 # Confidence fields carried per (seed, sample) beyond the FoldBench 5-tuple.

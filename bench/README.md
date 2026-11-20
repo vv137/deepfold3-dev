@@ -101,6 +101,7 @@ nohup bash bench/scripts/auto.sh runs/df3-stage0-r5 3600 \
 > per-step purge note) if you change the setting mid-sweep.
 | `make_pred_ref.py` | prediction tree → FoldBench `prediction_reference.csv` |
 | `eval_ost.py`      | `ost compare-structures` per sample (FoldBench-faithful flags) → mean/oracle LDDT, TM, GDT-TS |
+| `external_sets.py` | 2026ARK-AB / PXM-2025 (`ark_antibody_antigen`, `px_antibody_antigen`, `px_protein_protein`) for `eval_ost.py`: chain names, interfaces, trimmed ground truths |
 | `summarize.py`     | per-step + per-fold-class trajectory CSVs and plot |
 | `kfold_bench.py`   | external MSA-free baseline: bench inputs → AtlasFold / K-Fold queries → `runs/kfold/pred` tree (series `kfold`, step 0); see `docs/kfold-foldbench.md` |
 | `kfold_run.sh`     | resumable end-to-end K-Fold run: prepare → validate queries → predict → OST → compare |
@@ -158,6 +159,28 @@ see `memory/project_stage1_crop640`.)
 
 ## Conventions / gotchas
 
+- **External sets (2026ARK-AB, PXM-2025).** Inputs and ground truths are read from the
+  shared benchmark folder (`DF3_GW_BENCH`, default `/store/deepfold/users/gunwoong/Benchmark`,
+  never written). The model holds only the chains of the scored interfaces, so `eval_ost.py`
+  scores against a copy of the ground truth trimmed to the `chain_map.csv` chains
+  (`data/ground_truths_trimmed/<category>/`, with a sha256 manifest) and passes the
+  model→reference chain correspondence to OST explicitly (`-c`). CSV names such as `B.1`
+  resolve to the RCSB copy label `B-2` by the same rule as the set's `verify_mapping.py`.
+  Against the full assembly the interface DockQ is unchanged but global lDDT/TM fall
+  (9qrv sample: lDDT 0.85 → 0.64).
+- **8 PXM-2025 PPI targets never score** (13 of 882 interfaces; same at every checkpoint, so
+  cross-checkpoint comparisons are unaffected). OST cannot score them under the explicit mapping:
+  - `8u8e`, `9dlp`, `9dlv`: the scored partner chain holds `A1AMM`, which OST's compound library
+    does not know (SEQRES mismatch). The FoldBench rescue would drop exactly that chain.
+  - `9kkq`, `9kmn`: the partner chain is all `UNK` in the ground truth, so OST cannot chem-group it.
+  - `9bj5`, `9cd2`, `9r2z`: two copies of one protein that the PDB splits into two entities
+    (a methyl-lysine at different positions, or one extra N-terminal Met). The model chains are
+    identical, so OST puts both in one chem group and rejects the mapping. Automatic mapping
+    "succeeds" but maps only one chain, so the interface has no DockQ either.
+- **Re-deriving a result.** Every eval dir gets `provenance.json` (commit, dirty flag, OST
+  command and version, flags, and the external-set CSV hashes). `DF3_BENCH=<bench tree>` runs a
+  clean checkout's scripts against an existing `runs/` and `data/`, e.g.
+  `DF3_BENCH=/store/deepfold/users/vv137/foldbench/deepfold3-dev/bench python bench/scripts/eval_ost.py ...`.
 - **OST binary**: `/home/jovyan/.conda/envs/foldbench/bin/ost` (2.8.0). The
   conda env's bundled `python` can't import its own pip deps, so `eval_ost.py`
   calls the `ost` CLI directly from our venv and parses the JSON.
