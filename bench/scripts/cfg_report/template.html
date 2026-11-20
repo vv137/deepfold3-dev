@@ -110,9 +110,9 @@ code { font-family: var(--f-mono); font-size: 0.9em; }
 .vline { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 3; }
 .key { display: inline-flex; align-items: center; gap: 6px; }
 .key i { width: 18px; height: 3px; border-radius: 2px; display: inline-block; }
-:root { --m-s3: #2b6cb0; --m-fz: #b4541f; --m-fl: #6d4bb8; }
-@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --m-s3: #7fb0e8; --m-fz: #f0a06e; --m-fl: #b8a0f0; } }
-:root[data-theme="dark"] { --m-s3: #7fb0e8; --m-fz: #f0a06e; --m-fl: #b8a0f0; }
+:root { --m-s3: #2b6cb0; --m-fz: #b4541f; --m-fl: #6d4bb8; --m-fm: #2f855a; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --m-s3: #7fb0e8; --m-fz: #f0a06e; --m-fl: #b8a0f0; --m-fm: #7fd4a4; } }
+:root[data-theme="dark"] { --m-s3: #7fb0e8; --m-fz: #f0a06e; --m-fl: #b8a0f0; --m-fm: #7fd4a4; }
 .cl.dash { stroke-dasharray: 5 4; }
 :root { --w04: #2b5f9e; --w06: #4a8fd1; --w08: #8cc0ea; --w1: #59616b; --w2: #e8a36b; --w3: #c0612b; }
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --w04: #6fa3e6; --w06: #8fbdf0; --w08: #bcdaf6; --w1: #b5bdc7; --w2: #f0b98a; --w3: #e5864f; } }
@@ -128,7 +128,7 @@ code { font-family: var(--f-mono); font-size: 0.9em; }
 
   <section>
     <h2>체크포인트 계보</h2>
-    <div class="graph"><svg id="lineage" viewBox="0 0 900 360" role="img" aria-label="체크포인트 계보 그래프"></svg></div>
+    <div class="graph"><svg id="lineage" viewBox="0 0 900 480" role="img" aria-label="체크포인트 계보 그래프"></svg></div>
     <div class="legend">
       <span><i class="sw"></i>이 페이지에서 채점한 체크포인트</span>
       <span><i class="sw stop"></i>중단된 run (채점 안 함)</span>
@@ -217,6 +217,7 @@ const NODES = {
   s3s1: { x: 330, y: 150, run: "stage3-s1-001 5k", sub: "crop 640 · cond drop 없음", cfg: false, bench: true, short: "stage3-s1 5k (시작점)", trunk: "s1→s3" },
   fz:   { x: 640, y: 150, run: "frozen-cfg-zero-001 5k", sub: "trunk 고정 · fill = 0", cfg: true, bench: true, short: "frozen CFG · zero", trunk: "s1→s3 (고정)" },
   fl:   { x: 640, y: 270, run: "frozen-cfg-learned-001 5k", sub: "trunk 고정 · fill = null_pair", cfg: true, bench: true, short: "frozen CFG · learned", trunk: "s1→s3 (고정)" },
+  fm:   { x: 640, y: 390, run: "frozen-cfg-meaninit-001 5k", sub: "fill = 평균 pair 초기화 · scale 학습", cfg: true, bench: true, short: "frozen CFG · meaninit", trunk: "s1→s3 (고정)" },
   core: { x: 330, y: 270, run: "stage3-s1-core-001", sub: "core loss · 2912에서 중단", cfg: false, bench: false, stopped: true },
 };
 const EDGES = [
@@ -225,6 +226,7 @@ const EDGES = [
   { a: "s1", b: "s3s1", label: ["stage3-from-stage1 · 5k", "64 × 1"] },
   { a: "s3s1", b: "fz", label: ["frozen-cfg · 5k", "32 × 2 · MSE+bond"] },
   { a: "s3s1", b: "fl", label: ["frozen-cfg-learned · 5k", "32 × 2"] },
+  { a: "s3s1", b: "fm", label: ["frozen-cfg-meaninit · 5k", "64 × 1"] },
   { a: "s1", b: "core", label: ["core-loss · NCCL 타임아웃", "(Lustre 장애)"], dashed: true },
 ];
 const W = 200, H = 78;
@@ -462,7 +464,7 @@ function drawRescue(cat, scope) {
   }
 }
 
-const SC_PREFIX = [["stage1-rescore", "s1"], ["stage2-001-rescore", "s2"], ["stage3-s1-frozen-learned", "fl"],
+const SC_PREFIX = [["stage1-rescore", "s1"], ["stage2-001-rescore", "s2"], ["stage3-s1-frozen-meaninit", "fm"], ["stage3-s1-frozen-learned", "fl"],
   ["stage3-s1-frozen-zero", "fz"], ["stage3-s1-001", "s3s1"], ["stage3-001", "s3"]];
 function scLabel(name) {
   const m = name.match(/^(.+?)(?:-cfg-(full|abag|all)_w(-?[\d.]+))?$/);
@@ -555,7 +557,7 @@ function setupScatter() {
   sx.addEventListener("change", drawScatter); sy.addEventListener("change", drawScatter);
 }
 
-const MCOL = { s3: "var(--m-s3)", fz: "var(--m-fz)", fl: "var(--m-fl)" };
+const MCOL = { s3: "var(--m-s3)", fz: "var(--m-fz)", fl: "var(--m-fl)", fm: "var(--m-fm)" };
 let manyCat = null, manyMetric = "pass";
 function drawMany(cat) {
   cat = cat || manyCat; manyCat = cat;

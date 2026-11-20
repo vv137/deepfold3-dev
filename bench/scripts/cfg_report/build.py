@@ -33,6 +33,7 @@ MODELS = {
     "s3": ("stage3-001", "stage3-001"),
     "fz": ("stage3-s1-frozen-zero", "stage3-s1-frozen-zero"),
     "fl": ("stage3-s1-frozen-learned", "stage3-s1-frozen-learned"),
+    "fm": ("stage3-s1-frozen-meaninit", "stage3-s1-frozen-meaninit"),
 }
 BASE = [
     ("stage1-rescore:120000", "s1"),
@@ -41,6 +42,7 @@ BASE = [
     ("stage3-s1-001", "s3s1"),
     ("stage3-s1-frozen-zero", "fz"),
     ("stage3-s1-frozen-learned", "fl"),
+    ("stage3-s1-frozen-meaninit", "fm"),
 ]
 
 
