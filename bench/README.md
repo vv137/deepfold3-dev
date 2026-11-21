@@ -105,6 +105,8 @@ nohup bash bench/scripts/auto.sh runs/df3-stage0-r5 3600 \
 | `kfold_bench.py`   | external MSA-free baseline: bench inputs → AtlasFold / K-Fold queries → `runs/kfold/pred` tree (series `kfold`, step 0); see `docs/kfold-foldbench.md` |
 | `kfold_run.sh`     | resumable end-to-end K-Fold run: prepare → validate queries → predict → OST → compare |
 | `compare_series.py`| per-category AF3 vs a df3 checkpoint vs K-Fold on the common target set, seed-matched; `--after` / `--exclude-ids` controls |
+| `cfg_analysis.py`  | guidance (W) comparisons on scored interface series, common interface set: `table` (Oracle / Conf / Mean), `curves` (exact best-of-k by sample and by seed), `pool` (W-pooling at a fixed sample budget), `rescue` (interfaces the W = 1 run fails that another W solves, and the reverse) |
+| `cfg_report/build.py` | the same numbers as one HTML page (tables, best-of-k curves, rescue lists) from `cfg_report/template.html` |
 | `disto_probe.py`   | per-(target,step) **trunk** distogram recall / distoMed vs **structure** realization — separates "trunk knows the contact" from "sampler builds it" |
 | `disto_traj.py`    | **distoMed trajectory** over checkpoints (2 arms side-by-side) + plot — the trunk β-distance *consolidation gauge* |
 
